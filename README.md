@@ -1,71 +1,182 @@
-给clash做全局覆写，适配mihomo party和flclash，给singbox做配置混入的脚本
+给Flclash和mihomo party做节点配置的js脚本。
 
-全自动脚本，自带AI学习，分析，预测，研判，管理，分流，节点切换等全智能策略，无需任何人工干预和操作，直接导入或者粘贴复制即可。
+具体功能包含如下：
+- 1.
+智能节点选择 ：基于内置了一个 AI 模型，评估节点质量，自动选择最佳节点
+- 2.
+地理路由 ：根据目标 IP 地理信息智能选择地区节点
+- 3.
+多级缓存 ：实现 LRU 缓存机制，提高系统响应速度
+- 4.
+并发控制 ：通过并发池控制节点测试和请求处理
+- 5.
+故障降级 ：实现多级降级策略，确保系统稳定性
+- 6.
+数据持久化 ：支持节点数据的持久化存储和加载
+- 7.
+事件驱动 ：采用事件驱动架构，提高系统灵活性
+- 8.
+统计分析 ：提供丰富的统计功能，用于节点质量评估
 
-具体内容为：
+相关功能的实现原理：
 
-一、核心功能模块
+### 1. 整体架构概述
+该代码是一个用于智能代理选择和配置生成的 JavaScript 模块，主要面向 Clash/Mihomo 核心的代理管理。它实现了基于 AI 的节点评估、地理路由、智能配置生成等功能。
 
-1. 节点健康监测系统
-- 三协议混合探测（TCP/UDP/HTTP）
-- 动态超时机制：基于RTT和抖动计算基础超时时间（200ms~3s）
-- 智能滤波处理：采用EMA算法平滑网络波动
-- 实时指标收集：延迟、丢包率、抖动等
-2. 智能调度算法
-- 动态权重计算：基于网络质量趋势自动调整各指标权重
-- 多维度评估体系：
-  • 实时成功率（60%权重）
-  • 历史衰减数据（25%权重）
-  • 网络抖动系数（15%权重）
-3. 故障处理机制
-- 分级熔断策略：
-  │ 普通节点：3次失败切换
-  │ 优质节点：评分下降50%触发保护
-- 智能隔离系统：
-  • 基础隔离时长24小时
-  • 动态隔离系数（0.5~1.5倍）基于节点稳定性
-  
-二、关键技术实现
-
-1. 质量评估算法
-// 节点稳定性评分计算公式
-score = (SR * 0.6) + (HS * 0.25 * TDF) + (JQ * 0.15) 
-// SR: 实时成功率, HS: 历史衰减数据, TDF: 时间衰减因子, JQ: 网络抖动系数
-
-2. 动态权重调整
-// 基于网络质量趋势的权重计算（示例）
-_getTrafficFactor(metricType) {
-  const successTrend = /* 成功率趋势分
-  析 */;
-  const latencyTrend = /* 延迟变化率 
-  */;
-  return baseWeight * (1 + Math.tanh
-  (successTrend - latencyTrend));
+### 2. 核心组件分析 2.1 常量定义 (CONSTANTS)
+```
+const CONSTANTS = {
+  NODE_PREHEAT_COUNT: 3,
+  BATCH_SIZE: 10,
+  CONCURRENCY_LIMIT: 5,
+  // ... 其他常量
+};
+```
+实现原理：定义系统运行所需的各种常量参数，用于控制节点预热数量、批处理大小、并发限制等。
+ 2.2 事件发射器基类 (EventEmitter)
+```
+class EventEmitter {
+  // 实现了基本的事件订阅和发布机制
 }
+```
+实现原理：提供事件驱动的编程模型，允许组件之间进行松耦合通信。
+ 2.3 应用状态类 (AppState)
+```
+class AppState {
+  constructor() {
+    this.nodes = new Map();
+    this.metrics = new Map();
+    // ...
+  }
+}
+```
+实现原理：维护应用的全局状态，包括节点信息、指标数据等。
+ 2.4 LRU缓存类 (LRUCache)
+```
+class LRUCache {
+  // 实现了基于 Map 的 LRU 缓存机制
+}
+```
+实现原理：通过 Map 数据结构实现最近最少使用缓存淘汰策略，用于缓存 IP 地理信息、节点指标等。
+ 2.5 滚动统计类 (RollingStats)
+```
+class RollingStats {
+  // 实现了滑动窗口统计
+}
+```
+实现原理：维护一个固定大小的滑动窗口，用于计算延迟等指标的统计信息。
+ 2.6 成功率跟踪类 (SuccessRateTracker)
+```
+class SuccessRateTracker {
+  // 跟踪请求成功率
+}
+```
+实现原理：记录成功和失败次数，计算成功率。
+ 2.7 节点管理器类 (NodeManager)
+```
+class NodeManager {
+  // 管理节点质量评分和历史记录
+}
+```
+实现原理：维护节点的质量评分和历史记录，提供获取最佳节点的方法。
+ 2.8 中央管理器类 (CentralManager)
+这是整个系统的核心类，包含以下主要功能：
+ a. 网络请求与超时控制
+```
+async _safeFetch(url, options = {}, timeout = 
+5000)
+```
+实现原理：封装 fetch API，添加超时控制和 AbortController 支持，防止请求长时间挂起。
+ b. IP 地理信息查询
+```
+async getGeoInfo(ip, domain)
+```
+实现原理：通过 ip-api.com 和 ipinfo.io 等多个 API 获取 IP 地理信息，并实现多级降级策略和缓存机制。
+ c. 数据持久化
+```
+async loadAIDBFromFile()
+async saveAIDBToFile()
+```
+实现原理：实现 AI 节点数据的加载和保存功能，支持多环境存储（浏览器、Node.js 等）。
+ d. 事件系统
+```
+setupEventListeners()
+cleanupEventListeners()
+```
+实现原理：管理配置变更、网络状态等事件监听，确保资源正确释放。
+ e. 节点评估机制
+```
+async preheatNodes()
+async calculateNodeQualityScore()
+autoEliminateNodes()
+```
+实现原理：通过预热节点、计算质量评分和自动淘汰低质量节点来维护节点池的健康状态。
+ f. 地理感知路由
+```
+async handleRequestWithGeoRouting()
+```
+实现原理：根据目标 IP 的地理信息智能选择相应地区的节点。
+ g. 代理请求处理
+```
+async handleProxyRequest()
+```
+实现原理：实现智能节点选择和请求转发逻辑。
+ h. AI节点评分模型
+```
+aiScoreNode()
+extractNodeFeatures()
+predictNodeFuturePerformance()
+```
+实现原理：基于多维度指标（延迟、丢包、抖动、成功率等）预测节点未来表现，并计算评分调整值。
+ i. 配置处理
+```
+processConfiguration()
+```
+实现原理：处理原始配置对象，生成最终的代理配置，包括代理组、规则等。
 
-3. 探测优化机制
-- 协议差异化超时：
-  TCP超时 = 基础超时 * 1.2 * √(平滑RTT/基准RTT)
-  UDP超时 = 基础超时 * 0.8 * (1 + RTT标准差/基准RTT)
+### 3. 工具函数模块 (Utils) 3.1 地区代理过滤
+```
+filterProxiesByRegion()
+```
+实现原理：根据地区正则表达式和倍率限制过滤代理节点。
+ 3.2 服务组创建
+```
+createServiceGroups()
+```
+实现原理：根据配置创建不同的服务组和规则。
+ 3.3 并发控制
+```
+runWithConcurrency()
+asyncPool()
+```
+实现原理：实现并发任务执行控制，避免资源耗尽。
+ 3.4 重试机制
+```
+retry()
+```
+实现原理：实现指数退避重试机制，提高系统稳定性。
+ 3.5 统计计算
+```
+calculateWeightedAverage()
+calculateStdDev()
+calculateTrend()
+calculatePercentile()
+```
+实现原理：提供各种统计计算方法，用于节点质量评估。
 
-4. 数据存储结构
+### 4. 配置系统 (Config) 4.1 规则选项
+定义了各种服务的启用开关。
+ 4.2 地区配置
+定义了不同地区节点的识别规则和倍率限制。
+ 4.3 DNS配置
+配置了 DNS 相关参数，包括 nameserver、策略等。
+ 4.4 服务配置
+定义了各种服务的规则、图标、URL 等信息。
+ 4.5 系统配置
+配置了 Clash/Mihomo 核心的各种系统参数。
 
-// 使用分层存储优化内存使用
-fullWindow: 保存最近100条全量数据
-sampledWindow: 每10条采样1条存储900条
-
-三、特色功能
-
-1. 优质节点保护机制
-- 自动标记评分>85%的节点
-- 触发条件：成功率>90%且延迟<150ms
-- 保护期动态调整（1~24小时）
-2. 网络质量感知
-- 实时计算网络质量衰减系数：
-  QDF = e^(-Δt/历史窗口)
-- 动态调整探测频率（300~600秒）
-3. 异常处理策略
-- 分级恢复机制：
-  │ 临时故障：5分钟冷却
-  │ 持续故障：指数退避重试
-  │ 硬件故障：24小时隔离
+### 5. 主函数 (main)
+```
+function main(config)
+```
+实现原理：作为入口函数，创建 CentralManager 实例并处理配置。
