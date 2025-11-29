@@ -1,4 +1,4 @@
-# clash-verge&flclash&mihomo.js 智能分流配置脚本 - 使用说明
+# clash-verge&Flclash&mihomo.js 智能分流配置脚本 - 使用说明
 
 ## 📖 简介
 
@@ -216,5 +216,6 @@ A: 在脚本中设置 `ENABLE_SCORE_DEBUGGING: true` 可以启用调试日志，
 ---
 
 **提示**：本脚本为自动化工具，建议在理解其工作原理后再进行高级配置修改。如有问题，请查看日志输出或联系技术支持。
+
 
 
