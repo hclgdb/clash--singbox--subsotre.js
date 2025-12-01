@@ -10,8 +10,15 @@
 // All new variables, classes, and functions are defined explicitly here.
 // ======================================================
 
+// ================= Platform detection =================
+const PLATFORM = (() => {
+  const isNode = typeof process !== "undefined" && !!process.versions?.node;
+  const isBrowser = typeof window !== "undefined" && typeof window.addEventListener === "function";
+  return Object.freeze({ isNode, isBrowser });
+})();
+
 // ================= Constants =================
-const CONSTANTS = {
+const CONSTANTS = Object.freeze({
   PREHEAT_NODE_COUNT: 10,
   BATCH_SIZE: 5,
   NODE_TEST_TIMEOUT: 5000,
@@ -28,57 +35,49 @@ const CONSTANTS = {
   QUALITY_SCORE_THRESHOLD: 30,
   NODE_CLEANUP_THRESHOLD: 20,
   GEO_INFO_TIMEOUT: 3000,
-  FEATURE_WINDOW_SIZE: 50, // increase window for richer features
+  FEATURE_WINDOW_SIZE: 50,
   ENABLE_SCORE_DEBUGGING: false,
   QUALITY_WEIGHT: 0.5,
   METRIC_WEIGHT: 0.35,
   SUCCESS_WEIGHT: 0.15,
-  // Cache cleanup
   CACHE_CLEANUP_THRESHOLD: 0.1,
   CACHE_CLEANUP_BATCH_SIZE: 50,
-  // Retry/backoff
   MAX_RETRY_ATTEMPTS: 3,
   RETRY_DELAY_BASE: 200,
-  // Platform compat
   DEFAULT_USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-  // Availability thresholds
-  AVAILABILITY_MIN_RATE: 0.75,      // below this, node deprioritized
-  AVAILABILITY_EMERGENCY_FAILS: 2,  // consecutive hard fails to bypass cooldown
-  // Throughput normalization caps (bits/s)
-  THROUGHPUT_SOFT_CAP_BPS: 50_000_000, // 50 Mbps soft-cap for scoring
+  AVAILABILITY_MIN_RATE: 0.75,
+  AVAILABILITY_EMERGENCY_FAILS: 2,
+  THROUGHPUT_SOFT_CAP_BPS: 50_000_000,
   THROUGHPUT_SCORE_MAX: 15,
-  // Metrics clamp
   LATENCY_CLAMP_MS: 3000,
   JITTER_CLAMP_MS: 500,
   LOSS_CLAMP: 1.0
-};
+});
 
 // ================= Logging =================
 class Logger {
-  static error(...args) { console.error(...args); }
-  static info(...args) { console.info(...args); }
-  static debug(...args) { if (CONSTANTS.ENABLE_SCORE_DEBUGGING) console.debug(...args); }
-  static warn(...args) { console.warn(...args); }
+  static error(...args) { console.error("[ERROR]", ...args); }
+  static info(...args) { console.info("[INFO]", ...args); }
+  static debug(...args) { if (CONSTANTS.ENABLE_SCORE_DEBUGGING) console.debug("[DEBUG]", ...args); }
+  static warn(...args) { console.warn("[WARN]", ...args); }
 }
 
 // ================= Errors =================
 class ConfigurationError extends Error {
-  constructor(message) {
-    super(message); this.name = "ConfigurationError";
-  }
+  constructor(message) { super(message); this.name = "ConfigurationError"; }
 }
 class InvalidRequestError extends Error {
-  constructor(message) {
-    super(message); this.name = "InvalidRequestError";
-  }
+  constructor(message) { super(message); this.name = "InvalidRequestError"; }
 }
 
 // ================= Event emitter =================
 class EventEmitter {
   constructor() { this.eventListeners = new Map(); }
   on(event, listener) {
-    if (!this.eventListeners.has(event)) this.eventListeners.set(event, []);
-    this.eventListeners.get(event).push(listener);
+    if (!event || typeof listener !== "function") return;
+    const arr = this.eventListeners.get(event) || [];
+    arr.push(listener);
+    this.eventListeners.set(event, arr);
   }
   off(event, listener) {
     if (!this.eventListeners.has(event)) return;
@@ -88,10 +87,12 @@ class EventEmitter {
     if (arr.length === 0) this.eventListeners.delete(event);
   }
   emit(event, ...args) {
-    if (!this.eventListeners.has(event)) return;
-    [...this.eventListeners.get(event)].forEach(fn => {
+    const arr = this.eventListeners.get(event);
+    if (!arr || arr.length === 0) return;
+    const snapshot = [...arr];
+    for (const fn of snapshot) {
       try { fn(...args); } catch (e) { Logger.error(`事件 ${event} 处理失败:`, e.stack || e); }
-    });
+    }
   }
   removeAllListeners(event) {
     if (event) this.eventListeners.delete(event);
@@ -108,7 +109,9 @@ class AppState {
     this.lastUpdated = Date.now();
   }
   updateNodeStatus(nodeId, status) {
-    this.nodes.set(nodeId, { ...this.nodes.get(nodeId), ...status });
+    if (!nodeId || typeof nodeId !== "string") return;
+    const prev = this.nodes.get(nodeId) || {};
+    this.nodes.set(nodeId, { ...prev, ...status });
     this.lastUpdated = Date.now();
   }
 }
@@ -117,90 +120,79 @@ class AppState {
 class LRUCache {
   constructor({ maxSize = CONSTANTS.LRU_CACHE_MAX_SIZE, ttl = CONSTANTS.LRU_CACHE_TTL } = {}) {
     this.cache = new Map();
-    this.maxSize = maxSize;
-    this.ttl = ttl;
+    this.maxSize = Math.max(1, Number(maxSize) || CONSTANTS.LRU_CACHE_MAX_SIZE);
+    this.ttl = Math.max(1, Number(ttl) || CONSTANTS.LRU_CACHE_TTL);
     this.head = { key: null, prev: null, next: null };
     this.tail = { key: null, prev: this.head, next: null };
     this.head.next = this.tail;
   }
-  _removeEntry(node) {
+  _unlink(node) {
+    if (!node || node === this.head || node === this.tail) return;
+    const { prev, next } = node;
+    if (prev) prev.next = next;
+    if (next) next.prev = prev;
+    node.prev = null; node.next = null;
+  }
+  _pushFront(node) {
     if (!node) return;
-    try {
-      if (node.prev) node.prev.next = node.next;
-      if (node.next) node.next.prev = node.prev;
-      node.prev = null; node.next = null;
-    } catch {}
+    node.prev = this.head;
+    node.next = this.head.next;
+    if (this.head.next) this.head.next.prev = node;
+    this.head.next = node;
   }
-  _moveToFront(node) {
-    if (!node || !node.prev || !node.next) return;
-    try {
-      node.prev.next = node.next;
-      node.next.prev = node.prev;
-      node.next = this.head.next;
-      node.prev = this.head;
-      if (this.head.next) this.head.next.prev = node;
-      this.head.next = node;
-    } catch {}
-  }
-  _removeTail() {
+  _evictTail() {
     const node = this.tail.prev;
     if (!node || node === this.head) return null;
-    this._removeEntry(node);
-    const key = node.key;
-    this.cache.delete(key);
-    return key;
+    this._unlink(node);
+    this.cache.delete(node.key);
+    return node.key;
   }
   get(key) {
     const entry = this.cache.get(key);
-    if (!entry || Date.now() - entry.timestamp > entry.ttl) {
-      if (entry) { this._removeEntry(entry); this.cache.delete(key); }
+    if (!entry) return null;
+    const expired = (Date.now() - entry.timestamp) > entry.ttl;
+    if (expired) {
+      this._unlink(entry);
+      this.cache.delete(key);
       return null;
     }
-    this._moveToFront(entry);
+    // refresh recency & timestamp
+    this._unlink(entry);
     entry.timestamp = Date.now();
+    this._pushFront(entry);
     return entry.value;
   }
   set(key, value, ttl = this.ttl) {
+    if (key == null) return;
     const ratio = this.cache.size / this.maxSize;
     if (ratio > CONSTANTS.CACHE_CLEANUP_THRESHOLD) {
       this._cleanupExpiredEntries(CONSTANTS.CACHE_CLEANUP_BATCH_SIZE);
     }
+    const now = Date.now();
     if (this.cache.has(key)) {
       const entry = this.cache.get(key);
-      entry.value = value; entry.timestamp = Date.now();
-      this._moveToFront(entry);
+      entry.value = value; entry.ttl = Math.max(1, ttl | 0); entry.timestamp = now;
+      this._unlink(entry); this._pushFront(entry);
       return;
     }
     if (this.cache.size >= this.maxSize) {
-      const k = this._removeTail();
+      const k = this._evictTail();
       if (k) Logger.debug(`LRU 移除键: ${k}`);
     }
-    const newNode = {
-      key, value, ttl, timestamp: Date.now(),
-      prev: this.head, next: this.head.next
-    };
-    this.head.next.prev = newNode;
-    this.head.next = newNode;
+    const newNode = { key, value, ttl: Math.max(1, ttl | 0), timestamp: now, prev: null, next: null };
+    this._pushFront(newNode);
     this.cache.set(key, newNode);
   }
   _cleanupExpiredEntries(limit = 100) {
     const now = Date.now();
-    let cleaned = 0, iterations = 0;
-    const maxIter = Math.min(this.cache.size, limit * 2);
-    const toDelete = [];
+    let cleaned = 0;
     for (const [key, entry] of this.cache) {
-      iterations++;
-      if (now - entry.timestamp > entry.ttl) {
-        toDelete.push(key);
+      if ((now - entry.timestamp) > entry.ttl) {
+        this._unlink(entry);
+        this.cache.delete(key);
         cleaned++;
         if (cleaned >= limit) break;
       }
-      if (iterations >= maxIter) break;
-    }
-    for (const k of toDelete) {
-      const entry = this.cache.get(k);
-      if (entry) this._removeEntry(entry);
-      this.cache.delete(k);
     }
     if (cleaned > 0) Logger.debug(`清理了 ${cleaned} 个过期缓存项`);
   }
@@ -212,7 +204,7 @@ class LRUCache {
   delete(key) {
     const entry = this.cache.get(key);
     if (!entry) return false;
-    this._removeEntry(entry);
+    this._unlink(entry);
     this.cache.delete(key);
     return true;
   }
@@ -221,17 +213,17 @@ class LRUCache {
 // ================= Rolling stats and trackers =================
 class RollingStats {
   constructor(windowSize = 100) {
-    this.windowSize = windowSize;
-    this.data = new Array(windowSize).fill(0);
+    this.windowSize = Math.max(1, windowSize | 0);
+    this.data = new Array(this.windowSize).fill(0);
     this.index = 0; this.count = 0; this.sum = 0;
   }
   add(value) {
-    value = Number(value) || 0;
+    const v = Number(value) || 0;
     if (this.count < this.windowSize) {
-      this.data[this.index] = value; this.sum += value; this.count++;
+      this.data[this.index] = v; this.sum += v; this.count++;
     } else {
       const prev = this.data[this.index] || 0;
-      this.data[this.index] = value; this.sum += value - prev;
+      this.data[this.index] = v; this.sum += v - prev;
     }
     this.index = (this.index + 1) % this.windowSize;
   }
@@ -251,7 +243,7 @@ class SuccessRateTracker {
 
 // ================= Utils =================
 const Utils = {
-  sleep(ms = 0) { return new Promise(r => setTimeout(r, ms)); },
+  sleep(ms = 0) { return new Promise(r => setTimeout(r, Math.max(0, ms | 0))); },
   async retry(fn, attempts = CONSTANTS.MAX_RETRY_ATTEMPTS, delay = CONSTANTS.RETRY_DELAY_BASE) {
     if (typeof fn !== "function") throw new Error("retry: 第一个参数必须是函数");
     const maxAttempts = Math.max(1, Math.min(10, Math.floor(attempts) || 3));
@@ -268,7 +260,7 @@ const Utils = {
     const validLimit = Math.max(1, Math.min(50, Math.floor(limit) || 5));
     const results = []; let idx = 0; const errors = [];
     async function next() {
-      while (idx < tasks.length) {
+      while (true) {
         const current = idx++;
         if (current >= tasks.length) break;
         const task = tasks[current];
@@ -402,7 +394,7 @@ class NodeManager extends EventEmitter {
     return !!(end && Date.now() < end);
   }
   _getCooldownTime(nodeId) {
-    const score = this.nodeQuality.get(nodeId) || 0;
+    const score = Math.max(0, Math.min(100, this.nodeQuality.get(nodeId) || 0));
     return Math.max(
       CONSTANTS.MIN_SWITCH_COOLDOWN,
       Math.min(CONSTANTS.MAX_SWITCH_COOLDOWN, CONSTANTS.BASE_SWITCH_COOLDOWN * (1 + score / 100))
@@ -416,19 +408,18 @@ class NodeManager extends EventEmitter {
       reason: oldNodeId ? "质量过低" : "初始选择"
     };
     // ready for external logging integration
+    Logger.debug("SwitchEvent", event);
   }
   _updateNodeHistory(nodeId, score) {
+    const s = Math.max(0, Math.min(100, Number(score) || 0));
     const history = this.nodeHistory.get(nodeId) || [];
-    history.push({ timestamp: Date.now(), score });
-    if (history.length > CONSTANTS.MAX_HISTORY_RECORDS) {
-      this.nodeHistory.set(nodeId, history.slice(-CONSTANTS.MAX_HISTORY_RECORDS));
-    } else {
-      this.nodeHistory.set(nodeId, history);
-    }
+    history.push({ timestamp: Date.now(), score: s });
+    this.nodeHistory.set(nodeId, history.length > CONSTANTS.MAX_HISTORY_RECORDS ? history.slice(-CONSTANTS.MAX_HISTORY_RECORDS) : history);
   }
   updateNodeQuality(nodeId, scoreDelta) {
+    const delta = Number(scoreDelta) || 0;
     const current = this.nodeQuality.get(nodeId) || 0;
-    const newScore = Math.max(0, Math.min(100, current + (Number(scoreDelta) || 0)));
+    const newScore = Math.max(0, Math.min(100, current + Math.max(-20, Math.min(20, delta))));
     this.nodeQuality.set(nodeId, newScore);
     this._updateNodeHistory(nodeId, newScore);
   }
@@ -439,7 +430,7 @@ class NodeManager extends EventEmitter {
     }
     if (this.currentNode === nodeId) return { id: nodeId };
     try {
-      const central = (typeof CentralManager !== "undefined" && CentralManager.getInstance) ? CentralManager.getInstance() : null;
+      const central = CentralManager.getInstance?.() || null;
       if (!central || !central.state || !central.state.config || !Array.isArray(central.state.config.proxies)) {
         Logger.warn("switchToNode: CentralManager 未初始化或配置无效"); return null;
       }
@@ -463,7 +454,7 @@ class NodeManager extends EventEmitter {
       Logger.warn("_selectBestPerformanceNode: 节点列表为空"); return null;
     }
     try {
-      const central = (typeof CentralManager !== "undefined" && CentralManager.getInstance) ? CentralManager.getInstance() : null;
+      const central = CentralManager.getInstance?.() || null;
       const scoreFor = (node) => {
         if (!node || !node.id) return 0;
         try {
@@ -472,10 +463,8 @@ class NodeManager extends EventEmitter {
           const metrics = nodeState.metrics || {};
           const availabilityRate = Number(nodeState.availabilityRate) || 0;
 
-          // Availability-first: penalize harshly if below threshold
           const availabilityPenalty = availabilityRate < CONSTANTS.AVAILABILITY_MIN_RATE ? -30 : 0;
 
-          // Metric scoring
           const latencyVal = Math.max(0, Math.min(CONSTANTS.LATENCY_CLAMP_MS, Number(metrics.latency) || 1000));
           const jitterVal = Math.max(0, Math.min(CONSTANTS.JITTER_CLAMP_MS, Number(metrics.jitter) || 100));
           const lossVal = Math.max(0, Math.min(CONSTANTS.LOSS_CLAMP, Number(metrics.loss) || 0));
@@ -487,7 +476,6 @@ class NodeManager extends EventEmitter {
           const throughputScore = Math.max(0, Math.min(CONSTANTS.THROUGHPUT_SCORE_MAX, Math.round(Math.log10(1 + bps) * 2)));
           const metricScore = Math.round(latencyScore + jitterScore + lossScore + throughputScore);
 
-          // Success rate (from trackers)
           let successRatePercent = 0;
           const tracker = this.nodeSuccess.get(node.id);
           if (tracker && typeof tracker.rate === "number") {
@@ -531,10 +519,9 @@ class NodeManager extends EventEmitter {
     try {
       const availableNodes = nodes.filter(node => node && node.id && !this.isInCooldown(node.id));
       const pool = availableNodes.length > 0 ? availableNodes : nodes;
-      // Region preference if geo given
       if (targetGeo && typeof targetGeo.regionName === "string") {
         try {
-          const central = (typeof CentralManager !== "undefined" && CentralManager.getInstance) ? CentralManager.getInstance() : null;
+          const central = CentralManager.getInstance?.() || null;
           if (central?.state?.nodes) {
             const regionalNodes = pool.filter(node => {
               try {
@@ -571,9 +558,13 @@ class NodeManager extends EventEmitter {
 
 // ================= Central manager (center) =================
 class CentralManager extends EventEmitter {
-  static getInstance() { return CentralManager.instance; }
+  static getInstance() {
+    if (!CentralManager.instance) CentralManager.instance = new CentralManager();
+    return CentralManager.instance;
+  }
   constructor() {
     super();
+    if (CentralManager.instance) return CentralManager.instance; // ensure singleton
     try {
       this.state = new AppState();
       this.stats = new RollingStats();
@@ -583,7 +574,6 @@ class CentralManager extends EventEmitter {
       this.geoInfoCache = new LRUCache({ maxSize: CONSTANTS.LRU_CACHE_MAX_SIZE, ttl: CONSTANTS.LRU_CACHE_TTL });
       this.eventListeners = null;
 
-      // Internal submodules (modularization without breaking APIs)
       this.metricsManager = new MetricsManager(this.state);
       this.availabilityTracker = new AvailabilityTracker(this.state, this.nodeManager);
       this.throughputEstimator = new ThroughputEstimator();
@@ -606,8 +596,7 @@ class CentralManager extends EventEmitter {
     let _fetch = (typeof fetch === "function") ? fetch : null;
     let _AbortController = (typeof AbortController !== "undefined") ? AbortController : null;
 
-    // Node fallbacks
-    if (!_fetch && typeof process !== "undefined" && process.versions && process.versions.node) {
+    if (!_fetch && PLATFORM.isNode) {
       try {
         const nf = require("node-fetch");
         _fetch = nf.default || nf;
@@ -656,8 +645,10 @@ class CentralManager extends EventEmitter {
     try {
       await this.loadAIDBFromFile().catch(err => Logger.warn("加载AI数据失败，使用默认值:", err && err.message ? err.message : err));
 
-      try { this.setupEventListeners(); }
-      catch (e) { Logger.warn("设置事件监听器失败:", e && e.message ? e.message : e); }
+      if (!this.eventListeners) {
+        try { this.setupEventListeners(); }
+        catch (e) { Logger.warn("设置事件监听器失败:", e && e.message ? e.message : e); }
+      }
 
       try {
         this.on("requestDetected", (targetIp) => {
@@ -668,11 +659,11 @@ class CentralManager extends EventEmitter {
       this.preheatNodes().catch(err => Logger.warn("节点预热失败:", err && err.message ? err.message : err));
 
       try {
-        if (typeof process !== "undefined" && process.on) {
+        if (PLATFORM.isNode && process.on) {
           const cleanup = () => { this.destroy().catch(err => Logger.error("清理资源失败:", err && err.message ? err.message : err)); };
           process.on("SIGINT", cleanup);
           process.on("SIGTERM", cleanup);
-        } else if (typeof window !== "undefined" && window.addEventListener) {
+        } else if (PLATFORM.isBrowser) {
           window.addEventListener("beforeunload", () => {
             this.destroy().catch(err => Logger.error("清理资源失败:", err && err.message ? err.message : err));
           });
@@ -707,7 +698,7 @@ class CentralManager extends EventEmitter {
     if (typeof Config !== "undefined" && Config.on) {
       Config.on("configChanged", this.eventListeners.configChanged);
     }
-    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    if (PLATFORM.isBrowser) {
       window.addEventListener("online", this.eventListeners.networkOnline);
     }
     if (this.nodeManager && typeof this.nodeManager.on === "function") {
@@ -720,7 +711,7 @@ class CentralManager extends EventEmitter {
     if (typeof Config !== "undefined" && Config.off) {
       try { Config.off("configChanged", this.eventListeners.configChanged); } catch {}
     }
-    if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
+    if (PLATFORM.isBrowser && typeof window.removeEventListener === "function") {
       try { window.removeEventListener("online", this.eventListeners.networkOnline); } catch {}
     }
     if (this.nodeManager && typeof this.nodeManager.off === "function") {
@@ -757,13 +748,11 @@ class CentralManager extends EventEmitter {
         Logger.error(`节点预热失败: ${node.id}`, res.__error && res.__error.message ? res.__error.message : res.__error);
         return;
       }
-      // compute bps for consistent scoring
       const bps = this.throughputEstimator.bpsFromBytesLatency(res);
       const enriched = { ...res, bps };
       this.state.updateNodeStatus(node.id, { initialMetrics: enriched, lastTested: Date.now() });
       this.metricsManager.append(node.id, enriched);
       this.nodeManager.updateNodeQuality(node.id, this.calculateInitialQualityScore(enriched));
-      // initialize availability tracker
       this.availabilityTracker.ensure(node.id);
     });
   }
@@ -801,7 +790,6 @@ class CentralManager extends EventEmitter {
       Logger.warn("evaluateNodeQuality: 无效的节点对象"); return;
     }
 
-    // probe metrics
     let metrics = null;
     try {
       metrics = await Utils.retry(() => this.testNodeMultiMetrics(node), CONSTANTS.MAX_RETRY_ATTEMPTS, CONSTANTS.RETRY_DELAY_BASE);
@@ -814,21 +802,17 @@ class CentralManager extends EventEmitter {
       }
     }
 
-    // compute bps if not present
     if (typeof metrics.bps !== "number") metrics.bps = this.throughputEstimator.bpsFromBytesLatency(metrics);
 
-    // availability record
     this.availabilityTracker.ensure(node.id);
     const isSimulated = metrics && metrics.__simulated === true;
     const latency = Math.max(0, Number(metrics?.latency) || 0);
     const timeoutThreshold = (CONSTANTS.NODE_TEST_TIMEOUT || 5000) * 2;
 
-    // hardFail indicates transport-level failure (set within probe)
     const hardFail = !!metrics.__hardFail;
     const success = !!(metrics && !isSimulated && latency > 0 && latency < timeoutThreshold && !hardFail);
     this.availabilityTracker.record(node.id, success, { hardFail });
 
-    // score
     let score = 0;
     try {
       score = this.calculateNodeQualityScore(metrics);
@@ -838,7 +822,6 @@ class CentralManager extends EventEmitter {
       score = 0;
     }
 
-    // geo
     let geoInfo = null;
     try {
       const nodeIp = (node.server && typeof node.server === "string") ? node.server.split(":")[0] : null;
@@ -847,7 +830,6 @@ class CentralManager extends EventEmitter {
       }
     } catch (e) { Logger.debug(`获取节点地理信息失败 (${node.id}):`, e.message); }
 
-    // state update
     try {
       this.nodeManager.updateNodeQuality(node.id, score);
       this.metricsManager.append(node.id, metrics);
@@ -859,7 +841,6 @@ class CentralManager extends EventEmitter {
       Logger.error(`更新节点状态失败 (${node.id}):`, e.message);
     }
 
-    // emergency switch: if current node hard fails or availability collapses, bypass cooldown
     try {
       const isCurrent = this.nodeManager.currentNode === node.id;
       const availRate = this.availabilityTracker.rate(node.id);
@@ -938,7 +919,7 @@ class CentralManager extends EventEmitter {
         currentNode = await this.nodeManager.switchToBestNode(allNodes);
       }
 
-      const clientIP = req.headers["X-Forwarded-For"] || req.headers["Remote-Address"];
+      const clientIP = req.headers?.["X-Forwarded-For"] || req.headers?.["Remote-Address"];
       const clientGeo = await this.getGeoInfo(clientIP);
 
       let targetGeo = null;
@@ -959,7 +940,7 @@ class CentralManager extends EventEmitter {
       this.recordRequestMetrics(currentNode, result, req);
       return result;
     } catch (error) {
-      Logger.error("代理请求处理失败:", error.stack);
+      Logger.error("代理请求处理失败:", error.stack || error);
       return this.proxyToDirect(...args);
     }
   }
@@ -992,7 +973,6 @@ class CentralManager extends EventEmitter {
         ? (typeof context.req.url === "string" ? context.req.url : context.req.url.toString())
         : "";
 
-      // streaming preference
       if (contentType.includes("video") || (url && /youtube|netflix|stream/i.test(url))) {
         try {
           const candidateIds = Array.from(this.state.nodes.entries())
@@ -1091,7 +1071,6 @@ class CentralManager extends EventEmitter {
     }
   }
 
-  // unify getIpGeolocation with primary/fallback HTTPS-first
   async getIpGeolocation(ip) { return this.getGeoInfo(ip); }
 
   async _fetchGeoFromPrimaryAPI(ip) {
@@ -1177,7 +1156,6 @@ class CentralManager extends EventEmitter {
       return result;
     } catch (error) {
       Logger.error(`代理请求失败 [${node.id}]: ${error && error.message ? error.message : error}`);
-      // mark hard fail for availability
       this.availabilityTracker.record(node.id, false, { hardFail: true });
       return { success: false, error: error && error.message ? error.message : String(error), latency: CONSTANTS.NODE_TEST_TIMEOUT };
     }
@@ -1268,13 +1246,10 @@ class CentralManager extends EventEmitter {
     risk += Math.min(features.currentLoss, 1) * weights.loss;
     risk += Math.min(features.latencyStd / 100, 1) * weights.jitter;
     risk += Math.max(0, (0.8 - features.successRate) / 0.8) * weights.successRate;
-    // trend penalties
     if (features.latencyTrend > 5) risk += 0.1 * weights.trend;
     if (features.lossTrend > 0.1) risk += 0.1 * weights.trend;
     if (features.successTrend < -0.1) risk += 0.1 * weights.trend;
-    // low recent quality
     risk += Math.max(0, (50 - features.recentQuality) / 50) * weights.quality;
-    // success reduces risk
     risk *= (1 - features.success * 0.3);
     risk = Math.max(0, Math.min(1, risk));
     const stabilityScore = Math.round((1 - risk) * 100);
@@ -1367,6 +1342,7 @@ class CentralManager extends EventEmitter {
     try {
       regionGroupNames = regionProxyGroups.filter(g => g && g.name).map(g => g.name);
       if (otherProxyGroups.length > 0) regionGroupNames.push("其他节点");
+      regionGroupNames = Array.from(new Set(regionGroupNames));
     } catch (e) { Logger.warn("构建区域组名称列表失败:", e.message); regionGroupNames = []; }
 
     try {
@@ -1451,7 +1427,7 @@ class CentralManager extends EventEmitter {
         let storage = null;
         try {
           if (typeof $persistentStore !== "undefined" && $persistentStore) storage = $persistentStore;
-          else if (typeof window !== "undefined" && window.localStorage) storage = window.localStorage;
+          else if (PLATFORM.isBrowser && window.localStorage) storage = window.localStorage;
         } catch (e) { Logger.debug("存储检测失败:", e.message); }
         if (storage) {
           try {
@@ -1476,7 +1452,7 @@ class CentralManager extends EventEmitter {
             Logger.error("AI数据解析失败:", e && e.stack ? e.stack : e);
             try {
               if (typeof $persistentStore !== "undefined" && $persistentStore.write) $persistentStore.write("", "ai_node_data");
-              else if (typeof window !== "undefined" && window.localStorage?.removeItem) window.localStorage.removeItem("ai_node_data");
+              else if (PLATFORM.isBrowser && window.localStorage?.removeItem) window.localStorage.removeItem("ai_node_data");
             } catch (delErr) { Logger.warn("删除损坏数据失败:", delErr.message); }
           }
         }
@@ -1494,9 +1470,9 @@ class CentralManager extends EventEmitter {
       if (!raw || raw.length === 0) { Logger.warn("序列化AI数据失败: 结果为空"); return; }
       let saved = false;
       try {
-        if (typeof $persistentStore !== "undefined" && $persistentStore?.write === "function") {
+        if (typeof $persistentStore !== "undefined" && typeof $persistentStore?.write === "function") {
           $persistentStore.write(raw, "ai_node_data"); saved = true;
-        } else if (typeof window !== "undefined" && window.localStorage?.setItem === "function") {
+        } else if (PLATFORM.isBrowser && typeof window.localStorage?.setItem === "function") {
           window.localStorage.setItem("ai_node_data", raw); saved = true;
         }
         if (saved) Logger.debug(`AI数据保存成功，共${Object.keys(data).length}条记录`);
@@ -1512,20 +1488,18 @@ class CentralManager extends EventEmitter {
 
     const timeout = CONSTANTS.NODE_TEST_TIMEOUT || 5000;
     const probe = async () => {
-      // Build a lightweight probe URL
       const probeUrl =
         node.proxyUrl ||
         node.probeUrl ||
         (node.server ? `http://${node.server}` : null);
 
-      // Optional TCP connect latency for Node.js
       let tcpLatencyMs = null;
-      if (typeof process !== "undefined" && process.versions?.node && node.server) {
+      if (PLATFORM.isNode && node.server) {
         try {
           const [host, portStr] = node.server.split(":");
           const port = parseInt(portStr || "80", 10) || 80;
           tcpLatencyMs = await this.throughputEstimator.tcpConnectLatency(host, port, timeout);
-        } catch (e) { tcpLatencyMs = null; }
+        } catch { tcpLatencyMs = null; }
       }
 
       if (!probeUrl) throw new Error("无探测URL，使用模拟测试");
@@ -1533,20 +1507,16 @@ class CentralManager extends EventEmitter {
       let response;
       try { response = await this._safeFetch(probeUrl, { method: "GET" }, timeout); }
       catch (e) {
-        // transport-level failure (hard fail)
         return { latency: timeout, loss: 1, jitter: 100, bytes: 0, bps: 0, __hardFail: true };
       }
       const latency = Date.now() - start;
 
-      // Streamed throughput measurement (browser/Node compatible)
       const measure = await this.throughputEstimator.measureResponse(response, timeout);
       const bytes = measure.bytes || 0;
-      const jitter = measure.jitter || 0;
+      const jitter = Math.max(0, Math.min(CONSTANTS.JITTER_CLAMP_MS, measure.jitter || 0));
 
-      // bps normalized
       const bps = this.throughputEstimator.bpsFromBytesLatency({ bytes, latency });
 
-      // Prefer TCP connect latency if available and reasonable
       const finalLatency = (typeof tcpLatencyMs === "number" && tcpLatencyMs > 0 && tcpLatencyMs < latency)
         ? tcpLatencyMs : latency;
 
@@ -1582,7 +1552,6 @@ class MetricsManager {
     if (!nodeId) return;
     const arr = this.state.metrics.get(nodeId) || [];
     arr.push(metrics);
-    // cap window size for scientific features
     if (arr.length > CONSTANTS.FEATURE_WINDOW_SIZE) {
       this.state.metrics.set(nodeId, arr.slice(-CONSTANTS.FEATURE_WINDOW_SIZE));
     } else {
@@ -1594,7 +1563,7 @@ class MetricsManager {
 class AvailabilityTracker {
   constructor(state, nodeManager) {
     this.state = state; this.nodeManager = nodeManager;
-    this.trackers = nodeManager.nodeSuccess; // unify with NodeManager's trackers
+    this.trackers = nodeManager.nodeSuccess;
   }
   ensure(nodeId) {
     if (!this.trackers.get(nodeId)) this.trackers.set(nodeId, new SuccessRateTracker());
@@ -1603,7 +1572,6 @@ class AvailabilityTracker {
     this.ensure(nodeId);
     const tracker = this.trackers.get(nodeId);
     tracker.record(success, opts);
-    // reflect on state for selection visibility
     const rate = tracker.rate;
     this.state.updateNodeStatus(nodeId, { availabilityRate: rate });
   }
@@ -1612,9 +1580,8 @@ class AvailabilityTracker {
 }
 
 class ThroughputEstimator {
-  // Node-only TCP connect latency (optional). Returns ms or throws.
   async tcpConnectLatency(host, port, timeout) {
-    if (!(typeof process !== "undefined" && process.versions?.node)) throw new Error("Not Node");
+    if (!PLATFORM.isNode) throw new Error("Not Node");
     const net = require("net");
     return new Promise((resolve, reject) => {
       const start = Date.now();
@@ -1623,22 +1590,17 @@ class ThroughputEstimator {
       const cleanup = (err) => {
         if (done) return; done = true;
         try { socket.destroy(); } catch {}
-        if (err) reject(err);
+        if (err) reject(err); else resolve(Date.now() - start);
       };
       socket.setTimeout(timeout, () => cleanup(new Error("TCP connect timeout")));
       socket.once("error", err => cleanup(err));
-      socket.connect(port, host, () => {
-        const ms = Date.now() - start;
-        cleanup(); resolve(ms);
-      });
+      socket.connect(port, host, () => cleanup());
     });
   }
 
-  // Cross-platform response measurement
   async measureResponse(response, timeoutMs) {
     let bytes = 0; let jitter = 0;
     try {
-      // Browser ReadableStream
       if (response?.body && typeof response.body.getReader === "function") {
         const reader = response.body.getReader();
         const maxBytes = 64 * 1024; // limit to 64KB
@@ -1654,14 +1616,12 @@ class ThroughputEstimator {
         jitter = Math.max(1, 200 - Math.min(200, Math.round(speedKbps / 10)));
         return { bytes, jitter };
       }
-      // Node.js: try arrayBuffer quickly
       if (response?.arrayBuffer) {
         const buf = await response.arrayBuffer();
         bytes = buf.byteLength || 0;
         jitter = 0;
         return { bytes, jitter };
       }
-      // Fallback: headers
       const len = response?.headers?.get?.("Content-Length");
       bytes = parseInt(len || "0");
       jitter = 0;
@@ -1779,6 +1739,11 @@ const Config = {
 
 // ================= Main =================
 function main(config) {
-  const centralManager = new CentralManager();
+  const centralManager = CentralManager.getInstance();
   return centralManager.processConfiguration(config);
+}
+
+// CommonJS/ESM compatibility (optional)
+if (typeof module !== "undefined") {
+  module.exports = { main, CentralManager, NodeManager, Config };
 }
