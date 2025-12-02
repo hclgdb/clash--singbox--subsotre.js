@@ -5,41 +5,105 @@
  * - 智能节点选择，事件驱动，无周期轮询
  * - 指标流/可用性信号/吞吐量测量统一加固
  * - 出站/入站协议与业务感知优化
- * - GitHub 资源统一镜像加速（健康检测 + 原站回退）
+ * - GitHub 资源统一镜像加速（健康检测 + 原站回退 + 轮换测试目标）
  */
 
-/* ===================== GitHub 访问加速（镜像健康检测 + Raw/Release） ===================== */
+/* ===================== GitHub 访问加速（镜像健康检测 + Raw/Release + 多目标） ===================== */
 const GH_MIRRORS = [
   "https://mirror.ghproxy.com/",
   "https://github.moeyy.xyz/",
   "https://ghproxy.com/",
-  "" // 原始 GitHub 回退
+  "" // 原始 GitHub（作为最后回退）
 ];
-// 短时缓存镜像健康结果，避免频繁探测
+
+// 轮换测试目标，避免单一路径失效
+const GH_TEST_TARGETS = [
+  "https://raw.githubusercontent.com/github/gitignore/main/Node.gitignore",
+  "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/main/README.md",
+  "https://raw.githubusercontent.com/cli/cli/trunk/README.md"
+];
+
+// 短时缓存镜像健康结果
 let __ghSelected = null;
 let __ghLastProbeTs = 0;
-const __GH_PROBE_TTL = 10 * 60 * 1000;
-async function __probeMirror(url, fetchFn) {
-  const testUrl = `${url}https://raw.githubusercontent.com/github/gitignore/main/Node.gitignore`;
+const __GH_PROBE_TTL = 10 * 60 * 1000; // 10分钟
+
+// 运行期动态更新的前缀（用于 GH_RAW/GH_RELEASE）
+let GH_PROXY_PREFIX = ""; // 由选择器动态覆盖
+
+async function fetchWithTimeout(url, opts = {}, timeout = 5000) {
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = timeout > 0 ? setTimeout(() => controller?.abort?.(), timeout) : null;
   try {
-    const resp = await fetchFn(testUrl, { method: "HEAD" });
-    return resp && (resp.status >= 200 && resp.status < 400);
-  } catch { return false; }
+    const resp = await fetch(url, { ...opts, signal: controller?.signal });
+    return resp;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
-async function selectBestMirror(fetchFn) {
+
+// 选择一个测试目标，以缓解单点失效；GET 比 HEAD 更兼容
+function pickTestTarget() {
+  const idx = Math.floor(Math.random() * GH_TEST_TARGETS.length);
+  return GH_TEST_TARGETS[idx];
+}
+
+// 探测某镜像是否可用
+async function __probeMirror(prefix, fetchFn) {
+  const testTarget = pickTestTarget();
+  const testUrl = prefix ? (prefix + testTarget) : testTarget; // "" 表示直连 GitHub
+  try {
+    const resp = await fetchFn(testUrl, { method: "GET", headers: { "User-Agent": CONSTANTS.DEFAULT_USER_AGENT } }, CONSTANTS.GEO_INFO_TIMEOUT);
+    return !!resp && resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+// 封装 fetchFn 以统一 timeout 行为（在 Node 安全环境内）
+function makeTimedFetcher(runtimeFetch, timeoutMs) {
+  return async (url, opts, to = timeoutMs) => {
+    // 如果是浏览器 fetch，直接用 Promise.race 的超时；如果是 Node polyfill，仍用 AbortController
+    if (to && to > 0) {
+      const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timer = setTimeout(() => controller?.abort?.(), to);
+      try {
+        return await runtimeFetch(url, { ...(opts || {}), signal: controller?.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    return runtimeFetch(url, opts || {});
+  };
+}
+
+// 选择最佳镜像（带缓存）
+async function selectBestMirror(runtimeFetch) {
   const now = Date.now();
   if (__ghSelected && (now - __ghLastProbeTs) < __GH_PROBE_TTL) return __ghSelected;
-  for (const m of GH_MIRRORS) {
-    try {
-      const ok = m === "" ? true : await __probeMirror(m, fetchFn);
-      if (ok) { __ghSelected = m; __ghLastProbeTs = now; return m; }
-    } catch {}
+
+  const timedFetch = makeTimedFetcher(runtimeFetch, CONSTANTS.GEO_INFO_TIMEOUT);
+
+  // 逐一探测镜像，最后才尝试直连 GitHub
+  for (const mirror of GH_MIRRORS) {
+    const ok = await __probeMirror(mirror, timedFetch);
+    if (ok) {
+      __ghSelected = mirror;
+      __ghLastProbeTs = now;
+      GH_PROXY_PREFIX = mirror; // 同步前缀
+      return mirror;
+    }
   }
-  __ghSelected = ""; __ghLastProbeTs = now;
-  return "";
+
+  // 全部镜像失败 → 尝试原始 GitHub（""），但必须验证可用
+  const githubOk = await __probeMirror("", timedFetch);
+  __ghSelected = githubOk ? "" : GH_MIRRORS[0]; // 如果 GitHub 不可用，回到首镜像以便下次再测
+  __ghLastProbeTs = now;
+  GH_PROXY_PREFIX = __ghSelected;
+  return __ghSelected;
 }
-// 默认先用首选前缀（在运行期被健康探测动态更新）
-let GH_PROXY_PREFIX = GH_MIRRORS[0] || "";
+
+// 基于当前前缀构造 RAW / RELEASE URL（运行时可被动态改写）
 const GH_RAW = (path) => `${GH_PROXY_PREFIX}https://raw.githubusercontent.com/${path}`;
 const GH_RELEASE = (path) => `${GH_PROXY_PREFIX}https://github.com/${path}`;
 
@@ -71,7 +135,6 @@ const CONSTANTS = Object.freeze({
   FEATURE_WINDOW_SIZE: 50,
   ENABLE_SCORE_DEBUGGING: false,
 
-  // 统一权重与分值上限，强调稳定优先
   QUALITY_WEIGHT: 0.5,
   METRIC_WEIGHT: 0.35,
   SUCCESS_WEIGHT: 0.15,
@@ -282,7 +345,7 @@ const Utils = {
   async runWithConcurrency(tasks, limit = 5) {
     if (!Array.isArray(tasks) || tasks.length === 0) return [];
     const validLimit = Math.max(1, Math.min(50, Math.floor(limit) || 5));
-    const results = []; let idx = 0; const errors = [];
+    const results = []; let idx = 0;
     async function next() {
       while (true) {
         const current = idx++;
@@ -295,7 +358,6 @@ const Utils = {
           results[current] = { status: "fulfilled", value };
         } catch (e) {
           results[current] = { status: "rejected", reason: e || new Error("任务执行失败") };
-          errors.push({ index: current, error: e });
         }
       }
     }
@@ -304,9 +366,7 @@ const Utils = {
     return results;
   },
   async asyncPool(tasks, concurrency = CONSTANTS.CONCURRENCY_LIMIT) {
-    if (!Array.isArray(tasks) || tasks.length === 0) return [];
-    const validConcurrency = Math.max(1, Math.min(50, Math.floor(concurrency) || CONSTANTS.CONCURRENCY_LIMIT || 3));
-    const results = await Utils.runWithConcurrency(tasks, validConcurrency);
+    const results = await Utils.runWithConcurrency(tasks, Math.max(1, Math.min(50, Math.floor(concurrency) || CONSTANTS.CONCURRENCY_LIMIT || 3)));
     return results.map(r => r && r.status === "fulfilled" ? r.value : { __error: (r && r.reason) || new Error("任务执行失败") });
   },
   calculateWeightedAverage(values, weightFactor = 0.9) {
@@ -565,9 +625,10 @@ class CentralManager extends EventEmitter {
       try {
         const best = await selectBestMirror(_fetch);
         GH_PROXY_PREFIX = best || "";
-        if (url.startsWith("https://raw.githubusercontent.com/")) url = `${GH_PROXY_PREFIX}${url}`;
-        else if (url.startsWith("https://github.com/")) url = `${GH_PROXY_PREFIX}${url}`;
-      } catch {}
+        url = `${GH_PROXY_PREFIX}${url}`;
+      } catch (e) {
+        Logger.warn("GH 镜像选择失败，使用原始URL:", e?.message || e);
+      }
     }
 
     const defaultOptions = { headers: { "User-Agent": CONSTANTS.DEFAULT_USER_AGENT, ...(options.headers || {}) }, ...options };
@@ -585,6 +646,7 @@ class CentralManager extends EventEmitter {
         throw err;
       }
     }
+    // 浏览器场景回退 Promise.race 超时
     if (timeout > 0) {
       const fp = _fetch(url, defaultOptions);
       const tp = new Promise((_, reject) => setTimeout(() => reject(new Error(`请求超时 (${timeout}ms): ${url}`)), timeout));
@@ -1281,6 +1343,7 @@ const ICONS = {
 
 const URLS = {
   rulesets: {
+    // 保持与原功能一致（镜像前缀动态生效）
     applications: GH_RAW("DustinWin/ruleset_geodata/clash-ruleset/applications.list"),
     ai: GH_RAW("dahaha-365/YaNet/dist/rulesets/mihomo/ai.list"),
     adblock_mihomo_mrs: GH_RAW("217heidai/adblockfilters/main/rules/adblockmihomo.mrs"),
