@@ -1,30 +1,34 @@
 "use strict";
 /**
- * Central orchestrator architecture with unified, availability-first node selection.
- * Preserves original APIs and behavior; strengthens metrics flow, availability signals,
- * throughput measurement, modularity, and cross-platform compat.
+ * 中央调度架构（Central Orchestrator）
+ * - 统一、可用性优先的节点选择
+ * - 保留原有 API 与行为
+ * - 加强指标流、可用性信号、吞吐量测量、模块化与跨平台兼容
  *
- * Added:
- * - Outbound and inbound request orchestration APIs:
- *   CentralManager.onRequestOutbound(reqCtx) -> selects best node & returns dispatch info
- *   CentralManager.onResponseInbound(resCtx) -> records metrics & adapts node quality/switch
- * - Smart protocol-aware heuristics for TCP/UDP/QUIC/HTTPS and large payload optimization
- * - Enhanced geo- and content-aware selection, with LRU memoization per user-country-host
+ * 新增：
+ * - 出站与入站请求调度 API：
+ *   CentralManager.onRequestOutbound(reqCtx) -> 选择最优节点并返回调度信息
+ *   CentralManager.onResponseInbound(resCtx) -> 记录指标并自适应节点质量/切换
+ * - 针对 TCP/UDP/QUIC/HTTPS 的智能协议感知优化 + 大流量负载优化
+ * - 增强的地理与内容感知选择，支持按 用户-国家-主机 的 LRU 缓存记忆
+ *
+ * 事件驱动，无周期性调度器；所有新增变量/类/函数均在本文件中显式定义。
  */
 
-// ================= Maintenance notice =================
-// Event-driven only; no periodic schedulers introduced.
-// All new variables, classes, and functions are defined explicitly here.
-// ======================================================
+/* ===================== GitHub 访问加速（ghproxy + Raw/Release） ===================== */
+// 如果你想使用原始 raw.githubusercontent.com，设置 GH_PROXY_PREFIX = "" 即可。
+const GH_PROXY_PREFIX = "https://ghproxy.com/";
+const GH_RAW = (path) => `${GH_PROXY_PREFIX}https://raw.githubusercontent.com/${path}`;
+const GH_RELEASE = (path) => `${GH_PROXY_PREFIX}https://github.com/${path}`;
 
-// ================= Platform detection =================
+/* ===================== 平台检测 ===================== */
 const PLATFORM = (() => {
   const isNode = typeof process !== "undefined" && !!process.versions?.node;
   const isBrowser = typeof window !== "undefined" && typeof window.addEventListener === "function";
   return Object.freeze({ isNode, isBrowser });
 })();
 
-// ================= Constants =================
+/* ===================== 常量定义 ===================== */
 const CONSTANTS = Object.freeze({
   PREHEAT_NODE_COUNT: 10,
   BATCH_SIZE: 5,
@@ -60,8 +64,8 @@ const CONSTANTS = Object.freeze({
   JITTER_CLAMP_MS: 500,
   LOSS_CLAMP: 1.0,
 
-  // Added outbound/inbound-aware tunables
-  LARGE_PAYLOAD_THRESHOLD_BYTES: 512 * 1024,      // 512KB: prefer high-throughput nodes
+  // 出站/入站调优参数
+  LARGE_PAYLOAD_THRESHOLD_BYTES: 512 * 1024,      // 512KB：偏向选择高吞吐节点
   STREAM_HINT_REGEX: /youtube|netflix|stream|video|live|hls|dash/i,
   AI_HINT_REGEX: /openai|claude|gemini|ai|chatgpt|api\.openai|anthropic|googleapis/i,
   GAMING_PORTS: [3074, 27015, 27016, 27017, 27031, 27036, 5000, 5001],
@@ -69,7 +73,7 @@ const CONSTANTS = Object.freeze({
   HTTP_PORTS: [80, 8080, 8880]
 });
 
-// ================= Logging =================
+/* ===================== 日志输出 ===================== */
 class Logger {
   static error(...args) { console.error("[ERROR]", ...args); }
   static info(...args) { console.info("[INFO]", ...args); }
@@ -77,7 +81,7 @@ class Logger {
   static warn(...args) { console.warn("[WARN]", ...args); }
 }
 
-// ================= Errors =================
+/* ===================== 错误类型 ===================== */
 class ConfigurationError extends Error {
   constructor(message) { super(message); this.name = "ConfigurationError"; }
 }
@@ -85,7 +89,7 @@ class InvalidRequestError extends Error {
   constructor(message) { super(message); this.name = "InvalidRequestError"; }
 }
 
-// ================= Event emitter =================
+/* ===================== 事件系统 ===================== */
 class EventEmitter {
   constructor() { this.eventListeners = new Map(); }
   on(event, listener) {
@@ -115,7 +119,7 @@ class EventEmitter {
   }
 }
 
-// ================= App state =================
+/* ===================== 应用状态 ===================== */
 class AppState {
   constructor() {
     this.nodes = new Map();   // nodeId -> { metrics, score, geoInfo, lastEvaluated, availability... }
@@ -131,7 +135,7 @@ class AppState {
   }
 }
 
-// ================= LRU cache =================
+/* ===================== LRU 缓存 ===================== */
 class LRUCache {
   constructor({ maxSize = CONSTANTS.LRU_CACHE_MAX_SIZE, ttl = CONSTANTS.LRU_CACHE_TTL } = {}) {
     this.cache = new Map();
@@ -224,7 +228,7 @@ class LRUCache {
   }
 }
 
-// ================= Rolling stats and trackers =================
+/* ===================== 滚动统计 & 成功率追踪 ===================== */
 class RollingStats {
   constructor(windowSize = 100) {
     this.windowSize = Math.max(1, windowSize | 0);
@@ -255,7 +259,7 @@ class SuccessRateTracker {
   reset() { this.successCount = 0; this.totalCount = 0; this.hardFailStreak = 0; }
 }
 
-// ================= Utils =================
+/* ===================== 工具函数 ===================== */
 const Utils = {
   sleep(ms = 0) { return new Promise(r => setTimeout(r, Math.max(0, ms | 0))); },
   async retry(fn, attempts = CONSTANTS.MAX_RETRY_ATTEMPTS, delay = CONSTANTS.RETRY_DELAY_BASE) {
@@ -389,7 +393,7 @@ const Utils = {
   }
 };
 
-// ================= Node manager =================
+/* ===================== 节点管理器 ===================== */
 class NodeManager extends EventEmitter {
   static getInstance() {
     if (!NodeManager.instance) NodeManager.instance = new NodeManager();
@@ -398,7 +402,7 @@ class NodeManager extends EventEmitter {
   constructor() {
     super();
     this.currentNode = null;
-    this.nodeQuality = new Map();        // id -> numeric quality 0-100
+    this.nodeQuality = new Map();        // id -> 0-100
     this.switchCooldown = new Map();     // id -> timestamp
     this.nodeHistory = new Map();        // id -> [{timestamp, score}]
     this.nodeSuccess = new Map();        // id -> SuccessRateTracker
@@ -441,10 +445,7 @@ class NodeManager extends EventEmitter {
     if (this.currentNode === nodeId) return { id: nodeId };
     try {
       const central = CentralManager.getInstance?.() || null;
-      if (!central || !central.state || !central.state.config || !Array.isArray(central.state.state?.config?.proxies || central.state.config.proxies)) {
-        // Support both defensive read and original shape
-      }
-      const node = central.state.config.proxies.find(n => n && n.id === nodeId) || null;
+      const node = central?.state?.config?.proxies?.find(n => n && n.id === nodeId) || null;
       if (!node) { Logger.warn(`尝试切换到不存在的节点: ${nodeId}`); return null; }
       const oldNodeId = this.currentNode;
       this.currentNode = nodeId;
@@ -566,7 +567,7 @@ class NodeManager extends EventEmitter {
   }
 }
 
-// ================= Central manager (center) =================
+/* ===================== 中央管理器 ===================== */
 class CentralManager extends EventEmitter {
   static getInstance() {
     if (!CentralManager.instance) CentralManager.instance = new CentralManager();
@@ -574,7 +575,7 @@ class CentralManager extends EventEmitter {
   }
   constructor() {
     super();
-    if (CentralManager.instance) return CentralManager.instance; // ensure singleton
+    if (CentralManager.instance) return CentralManager.instance;
     try {
       this.state = new AppState();
       this.stats = new RollingStats();
@@ -859,7 +860,7 @@ class CentralManager extends EventEmitter {
         const proxies = this.state?.config?.proxies;
         if (Array.isArray(proxies) && proxies.length > 0) {
           if (failStreak >= CONSTANTS.AVAILABILITY_EMERGENCY_FAILS) {
-            this.nodeManager.switchCooldown.delete(node.id); // bypass cooldown
+            this.nodeManager.switchCooldown.delete(node.id); // 旁路冷却
           }
           await this.nodeManager.switchToBestNode(proxies);
         }
@@ -911,11 +912,9 @@ class CentralManager extends EventEmitter {
     });
   }
 
-  // ===================== Outbound / Inbound orchestration =====================
-
   /**
-   * Outbound entry: choose best node for a request.
-   * reqCtx shape suggestion:
+   * 出站入口：为请求选择最佳节点
+   * reqCtx:
    * { url, method, headers, user, protocol, port, sni, host, contentLength, isUDP }
    */
   async onRequestOutbound(reqCtx = {}) {
@@ -923,7 +922,7 @@ class CentralManager extends EventEmitter {
     const nodes = this.state.config.proxies || [];
     if (!Array.isArray(nodes) || nodes.length === 0) return { mode: "direct" };
 
-    // Resolve host, protocol hints
+    // 解析 URL/协议/端口
     const urlStr = typeof reqCtx.url === "string" ? reqCtx.url : (reqCtx.url?.toString?.() || "");
     let hostname = reqCtx.host;
     let port = reqCtx.port;
@@ -937,6 +936,7 @@ class CentralManager extends EventEmitter {
       }
     } catch {}
 
+    // 客户端与目标地理信息
     const clientIP = reqCtx.clientIP ||
       reqCtx.headers?.["X-Forwarded-For"] ||
       reqCtx.headers?.["Remote-Address"];
@@ -950,7 +950,7 @@ class CentralManager extends EventEmitter {
       }
     } catch {}
 
-    // Heuristics: streaming / AI / large payload / gaming / TLS bias
+    // 业务偏好：流媒体/AI/大流量/游戏/TLS
     const isVideo = !!(reqCtx.headers?.["Content-Type"]?.includes("video") || CONSTANTS.STREAM_HINT_REGEX.test(urlStr));
     const isAI = CONSTANTS.AI_HINT_REGEX.test(urlStr || hostname || "");
     const isLarge = (Number(reqCtx.contentLength) || 0) >= CONSTANTS.LARGE_PAYLOAD_THRESHOLD_BYTES;
@@ -961,7 +961,7 @@ class CentralManager extends EventEmitter {
     const preferLowLatency = isGaming || isAI || isTLS;
     const preferStability = isAI || isVideo;
 
-    // Candidate filtering by recent metrics
+    // 候选集合（按指标强化）
     const enrichedCandidates = nodes
       .map(n => {
         const status = this.state.nodes.get(n.id);
@@ -977,7 +977,7 @@ class CentralManager extends EventEmitter {
       })
       .filter(c => c.node && c.node.id);
 
-    // Bias function
+    // 偏好打分
     const bias = (c) => {
       const base = c.score;
       const availabilityBonus = (c.availability >= CONSTANTS.AVAILABILITY_MIN_RATE) ? 10 : -30;
@@ -987,7 +987,7 @@ class CentralManager extends EventEmitter {
       return base + availabilityBonus + throughputBonus + latencyBonus - jitterPenalty;
     };
 
-    // Region-aware preference
+    // 区域偏好
     let regionPreferred = null;
     if (targetGeo?.country && Array.isArray(Config.regionOptions?.regions)) {
       regionPreferred = Utils.filterProxiesByRegion(nodes, Config.regionOptions.regions.find(r => {
@@ -1002,7 +1002,7 @@ class CentralManager extends EventEmitter {
       if (regionCandidates.length > 0) candidates = regionCandidates;
     }
 
-    // Final selection via NodeManager
+    // 最终选择
     const ordered = candidates
       .sort((a, b) => bias(b) - bias(a))
       .map(c => c.node);
@@ -1010,32 +1010,25 @@ class CentralManager extends EventEmitter {
     const bestNode = await this.nodeManager.getBestNode(ordered.length ? ordered : nodes, targetGeo);
     const selected = bestNode || nodes[0];
 
-    // Cache decision for user-country-host
+    // 用户-国家-主机 维度缓存
     const userStr = typeof reqCtx.user === "string" ? reqCtx.user : "default";
     const country = (clientGeo && clientGeo.country) ? clientGeo.country : "unknown";
     const cacheKey = `${userStr}:${country}:${hostname || "unknown"}`;
     try { if (selected?.id) this.lruCache.set(cacheKey, selected.id); } catch {}
 
-    // Return dispatch info, including mode and selected node
     if (!selected) return { mode: "direct" };
     return {
       mode: "proxy",
       node: selected,
       targetGeo,
       clientGeo,
-      reason: {
-        preferHighThroughput,
-        preferLowLatency,
-        preferStability,
-        isVideo, isAI, isLarge, isGaming, isTLS, isHTTP
-      }
+      reason: { preferHighThroughput, preferLowLatency, preferStability, isVideo, isAI, isLarge, isGaming, isTLS, isHTTP }
     };
   }
 
   /**
-   * Inbound entry: record response metrics & adapt node scoring.
-   * resCtx shape suggestion:
-   * { node, success, latency, bytes, url, method, status, headers }
+   * 入站入口：记录响应指标并自适应调整节点评分/切换
+   * resCtx: { node, success, latency, bytes, url, method, status, headers }
    */
   async onResponseInbound(resCtx = {}) {
     const node = resCtx.node;
@@ -1048,10 +1041,10 @@ class CentralManager extends EventEmitter {
     };
     const req = { url: resCtx.url, method: resCtx.method, headers: resCtx.headers };
 
-    // Record and adapt
+    // 记录与自适应
     this.recordRequestMetrics(node, result, req);
 
-    // Protective switching on repeated hard failures or slow response
+    // 保护性切换：硬失败或过慢/可用率过低
     const status = this.state.nodes.get(node.id) || {};
     const availRate = Number(status.availabilityRate) || 0;
     const failStreak = this.availabilityTracker.hardFailStreak(node.id);
@@ -1061,15 +1054,14 @@ class CentralManager extends EventEmitter {
     const belowAvail = availRate < CONSTANTS.AVAILABILITY_MIN_RATE;
 
     if (proxies.length > 0 && (failStreak >= CONSTANTS.AVAILABILITY_EMERGENCY_FAILS || belowAvail || isTooSlow)) {
-      // bypass cooldown if hard failures
       if (failStreak >= CONSTANTS.AVAILABILITY_EMERGENCY_FAILS) {
-        this.nodeManager.switchCooldown.delete(node.id);
+        this.nodeManager.switchCooldown.delete(node.id); // 旁路冷却
       }
       await this.nodeManager.switchToBestNode(proxies);
     }
   }
 
-  // ===================== Legacy proxy entry (kept, now uses orchestration) =====================
+  /* ===================== 兼容旧入口（走新调度） ===================== */
   async handleProxyRequest(req, ...args) {
     if (!this.state || !this.state.config) throw new ConfigurationError("系统配置未初始化");
     if (!req || !req.url) throw new InvalidRequestError("无效的请求对象或URL");
@@ -1092,7 +1084,6 @@ class CentralManager extends EventEmitter {
       const current = dispatch.node || (await this.nodeManager.switchToBestNode(this.state.config.proxies, dispatch.targetGeo));
       const result = await this.proxyRequestWithNode(current, ...args);
 
-      // Feed inbound response for adaptive updates
       await this.onResponseInbound({
         node: current,
         success: result.success,
@@ -1448,270 +1439,432 @@ class CentralManager extends EventEmitter {
     return 0;
   }
 
-  processConfiguration(config) {
-    if (!config || typeof config !== "object") throw new ConfigurationError("processConfiguration: 配置对象无效");
-    let safeConfig;
-    try {
-      safeConfig = JSON.parse(JSON.stringify(config));
-      if (!safeConfig || typeof safeConfig !== "object") throw new Error("深拷贝结果无效");
-    } catch (e) {
-      throw new ConfigurationError(`配置对象无法深拷贝: ${e && e.message ? e.message : "unknown error"}`);
-    }
-
-    try {
-      this.state.config = safeConfig;
-      this.stats?.reset?.();
-      this.successTracker?.reset?.();
-    } catch (e) { Logger.warn("重置统计信息失败:", e.message); }
-
-    const proxyCount = Array.isArray(safeConfig?.proxies) ? safeConfig.proxies.length : 0;
-    const providerCount = (typeof safeConfig?.["proxy-providers"] === "object" && safeConfig["proxy-providers"] !== null)
-      ? Object.keys(safeConfig["proxy-providers"]).length : 0;
-    if (proxyCount === 0 && providerCount === 0) throw new ConfigurationError("未检测到任何代理节点或代理提供者");
-
-    try {
-      if (Config?.system && typeof Config.system === "object") Object.assign(safeConfig, Config.system);
-      if (Config?.dns && typeof Config.dns === "object") safeConfig.dns = Config.dns;
-    } catch (e) { Logger.warn("应用系统配置失败:", e.message); }
-
-    if (!Config || !Config.enable) {
-      Logger.info("配置处理已禁用，返回原始配置"); return safeConfig;
-    }
-
-    const regionProxyGroups = [];
-    let otherProxyGroups = [];
-    try {
-      if (Array.isArray(safeConfig.proxies)) {
-        otherProxyGroups = safeConfig.proxies.filter(p => p && typeof p.name === "string").map(p => p.name);
-      }
-    } catch (e) { Logger.warn("处理代理列表失败:", e.message); otherProxyGroups = []; }
-
-    try {
-      if (Config.regionOptions && Array.isArray(Config.regionOptions.regions)) {
-        Config.regionOptions.regions.forEach(region => {
-          if (!region || typeof region !== "object") return;
-          try {
-            const names = Utils.filterProxiesByRegion(safeConfig.proxies || [], region);
-            if (Array.isArray(names) && names.length > 0) {
-              regionProxyGroups.push({
-                ...(Config.common?.proxyGroup || {}), name: region.name || "Unknown",
-                type: "url-test", tolerance: 50, icon: region.icon || "", proxies: names
-              });
-              otherProxyGroups = otherProxyGroups.filter(n => !names.includes(n));
-            }
-          } catch (e) { Logger.debug(`处理地区 ${region.name || "unknown"} 失败:`, e.message); }
-        });
-      }
-    } catch (e) { Logger.warn("处理地区代理组失败:", e.message); }
-
-    let regionGroupNames = [];
-    try {
-      regionGroupNames = regionProxyGroups.filter(g => g && g.name).map(g => g.name);
-      if (otherProxyGroups.length > 0) regionGroupNames.push("其他节点");
-      regionGroupNames = Array.from(new Set(regionGroupNames));
-    } catch (e) { Logger.warn("构建区域组名称列表失败:", e.message); regionGroupNames = []; }
-
-    try {
-      safeConfig["proxy-groups"] = [{
-        ...(Config.common?.proxyGroup || {}), name: "默认节点", type: "select",
-        proxies: [...regionGroupNames, "直连"],
-        icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Proxy.png"
-      }];
-    } catch (e) { Logger.warn("初始化代理组失败:", e.message); safeConfig["proxy-groups"] = []; }
-
-    try {
-      safeConfig.proxies = Array.isArray(safeConfig?.proxies) ? safeConfig.proxies : [];
-      if (!safeConfig.proxies.some(p => p && p.name === "直连")) {
-        safeConfig.proxies.push({ name: "直连", type: "direct" });
-      }
-    } catch (e) { Logger.warn("添加直连代理失败:", e.message); }
-
-    const ruleProviders = new Map();
-    const rules = [];
-    try {
-      if (Config.common?.ruleProvider && typeof Config.common.ruleProvider === "object") {
-        ruleProviders.set("applications", {
-          ...Config.common.ruleProvider,
-          behavior: "classical", format: "text",
-          url: "https://fastly.jsdelivr.net/gh/DustinWin/ruleset_geodata@clash-ruleset/applications.list",
-          path: "./ruleset/DustinWin/applications.list"
-        });
-      }
-      if (Array.isArray(Config.preRules)) rules.push(...Config.preRules);
-      if (typeof Utils.createServiceGroups === "function") {
-        Utils.createServiceGroups(safeConfig, regionGroupNames, ruleProviders, rules);
-      }
-    } catch (e) { Logger.warn("处理服务规则失败:", e.message); }
-
-    try {
-      if (Config.common && Array.isArray(Config.common.defaultProxyGroups)) {
-        Config.common.defaultProxyGroups.forEach(group => {
-          if (group && typeof group === "object" && group.name) {
-            try {
-              safeConfig["proxy-groups"].push({
-                ...(Config.common?.proxyGroup || {}),
-                name: group.name || "Unknown",
-                type: "select",
-                proxies: [...(Array.isArray(group.proxies) ? group.proxies : []), ...regionGroupNames],
-                url: group.url || (Config.common?.proxyGroup?.url || ""),
-                icon: group.icon || ""
-              });
-            } catch (e) { Logger.debug(`添加默认代理组失败 (${group.name}):`, e.message); }
-          }
-        });
-      }
-    } catch (e) { Logger.warn("添加默认代理组失败:", e.message); }
-
-    try { if (regionProxyGroups.length > 0) safeConfig["proxy-groups"] = (safeConfig["proxy-groups"] || []).concat(regionProxyGroups); }
-    catch (e) { Logger.warn("添加区域代理组失败:", e.message); }
-
-    try {
-      if (otherProxyGroups.length > 0) {
-        safeConfig["proxy-groups"].push({
-          ...(Config.common?.proxyGroup || {}),
-          name: "其他节点", type: "select", proxies: otherProxyGroups,
-          icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/World_Map.png"
-        });
-      }
-    } catch (e) { Logger.warn("添加其他节点组失败:", e.message); }
-
-    try {
-      if (Config.common && Array.isArray(Config.common.postRules)) rules.push(...Config.common.postRules);
-      safeConfig.rules = rules;
-    } catch (e) { Logger.warn("添加后置规则失败:", e.message); safeConfig.rules = rules; }
-
-    try { if (ruleProviders.size > 0) safeConfig["rule-providers"] = Object.fromEntries(ruleProviders); }
-    catch (e) { Logger.warn("添加规则提供者失败:", e.message); }
-
-    return safeConfig;
-  }
-
-  loadAIDBFromFile() {
-    return new Promise((resolve) => {
-      try {
-        let raw = "";
-        let storage = null;
-        try {
-          if (typeof $persistentStore !== "undefined" && $persistentStore) storage = $persistentStore;
-          else if (PLATFORM.isBrowser && window.localStorage) storage = window.localStorage;
-        } catch (e) { Logger.debug("存储检测失败:", e.message); }
-        if (storage) {
-          try {
-            if (typeof storage.getItem === "function") raw = storage.getItem("ai_node_data") || "";
-            else if (typeof storage.read === "function") raw = storage.read("ai_node_data") || "";
-          } catch (e) { Logger.warn("读取存储数据失败:", e.message); raw = ""; }
-        }
-        if (raw && typeof raw === "string" && raw.trim()) {
-          try {
-            const data = JSON.parse(raw);
-            if (typeof data === "object" && data !== null && !Array.isArray(data)) {
-              let loadedCount = 0;
-              Object.entries(data).forEach(([id, stats]) => {
-                if (id && typeof id === "string" && stats && typeof stats === "object") {
-                  try { this.state.metrics.set(id, Array.isArray(stats) ? stats : [stats]); loadedCount++; }
-                  catch (e) { Logger.debug(`加载节点数据失败 (${id}):`, e.message); }
-                }
-              });
-              Logger.info(`成功加载AI节点数据，共${loadedCount}条记录`);
-            } else { Logger.warn("AI数据格式无效，预期为对象"); }
-          } catch (e) {
-            Logger.error("AI数据解析失败:", e && e.stack ? e.stack : e);
-            try {
-              if (typeof $persistentStore !== "undefined" && $persistentStore.write) $persistentStore.write("", "ai_node_data");
-              else if (PLATFORM.isBrowser && window.localStorage?.removeItem) window.localStorage.removeItem("ai_node_data");
-            } catch (delErr) { Logger.warn("删除损坏数据失败:", delErr.message); }
-          }
-        }
-      } catch (e) { Logger.error("AI数据加载失败:", e && e.stack ? e.stack : e); }
-      finally { resolve(); }
-    });
-  }
-
-  saveAIDBToFile() {
-    try {
-      if (!this.state || !this.state.metrics) { Logger.warn("无法保存AI数据: state.metrics 未初始化"); return; }
-      const data = Object.fromEntries(this.state.metrics.entries());
-      if (!data || Object.keys(data).length === 0) { Logger.debug("没有AI数据需要保存"); return; }
-      const raw = JSON.stringify(data, null, 2);
-      if (!raw || raw.length === 0) { Logger.warn("序列化AI数据失败: 结果为空"); return; }
-      let saved = false;
-      try {
-        if (typeof $persistentStore !== "undefined" && typeof $persistentStore?.write === "function") {
-          $persistentStore.write(raw, "ai_node_data"); saved = true;
-        } else if (PLATFORM.isBrowser && typeof window.localStorage?.setItem === "function") {
-          window.localStorage.setItem("ai_node_data", raw); saved = true;
-        }
-        if (saved) Logger.debug(`AI数据保存成功，共${Object.keys(data).length}条记录`);
-        else Logger.warn("无法保存AI数据: 未找到可用的存储接口");
-      } catch (e) { Logger.error("AI数据保存到存储失败:", e && e.message ? e.message : e); }
-    } catch (e) { Logger.error("AI数据保存失败:", e && e.stack ? e.stack : e); }
-  }
-
-  async testNodeMultiMetrics(node) {
-    const cacheKey = `nodeMetrics:${node.id}`;
-    const cached = this.lruCache.get(cacheKey);
-    if (cached) return cached;
-
-    const timeout = CONSTANTS.NODE_TEST_TIMEOUT || 5000;
-    const probe = async () => {
-      const probeUrl =
-        node.proxyUrl ||
-        node.probeUrl ||
-        (node.server ? `http://${node.server}` : null);
-
-      let tcpLatencyMs = null;
-      if (PLATFORM.isNode && node.server) {
-        try {
-          const [host, portStr] = node.server.split(":");
-          const port = parseInt(portStr || "80", 10) || 80;
-          tcpLatencyMs = await this.throughputEstimator.tcpConnectLatency(host, port, timeout);
-        } catch { tcpLatencyMs = null; }
-      }
-
-      if (!probeUrl) throw new Error("无探测URL，使用模拟测试");
-      const start = Date.now();
-      let response;
-      try { response = await this._safeFetch(probeUrl, { method: "GET" }, timeout); }
-      catch (e) {
-        return { latency: timeout, loss: 1, jitter: 100, bytes: 0, bps: 0, __hardFail: true };
-      }
-      const latency = Date.now() - start;
-
-      const measure = await this.throughputEstimator.measureResponse(response, timeout);
-      const bytes = measure.bytes || 0;
-      const jitter = Math.max(0, Math.min(CONSTANTS.JITTER_CLAMP_MS, measure.jitter || 0));
-
-      const bps = this.throughputEstimator.bpsFromBytesLatency({ bytes, latency });
-
-      const finalLatency = (typeof tcpLatencyMs === "number" && tcpLatencyMs > 0 && tcpLatencyMs < latency)
-        ? tcpLatencyMs : latency;
-
-      return { latency: finalLatency, loss: 0, jitter, bytes, bps };
-    };
-
-    try {
-      const result = await Utils.retry(() => probe(), 2, 200);
-      try { this.lruCache.set(cacheKey, result, 60000); } catch {}
-      return result;
-    } catch (e) {
-      Logger.debug("真实网络探测失败，使用模拟数据:", e && e.message ? e.message : e);
-      return new Promise(resolve => {
-        setTimeout(() => {
-          const latency = Math.random() * 500 + 50;
-          const loss = Math.random() * 0.1;
-          const jitter = Math.random() * 50;
-          const bytes = Math.floor(Math.random() * 32 * 1024);
-          const bps = this.throughputEstimator.bpsFromBytesLatency({ bytes, latency });
-          const simulated = { latency, loss, jitter, bytes, bps, __simulated: true };
-          try { this.lruCache.set(cacheKey, simulated, 60000); } catch {}
-          resolve(simulated);
-        }, Math.random() * 500);
-      });
-    }
-  }
+  /* ===================== 资源（图标/规则/Geo 数据）常量 ===================== */
 }
 
-// ================= Internal submodules =================
+/* 将图标与规则、Geo 数据链接集中为常量，避免在 Config 中自引用 */
+const ICONS = {
+  Proxy: GH_RAW("Koolson/Qure/master/IconSet/Color/Proxy.png"),
+  WorldMap: GH_RAW("Koolson/Qure/master/IconSet/Color/World_Map.png"),
+  HongKong: GH_RAW("Koolson/Qure/master/IconSet/Color/Hong_Kong.png"),
+  UnitedStates: GH_RAW("Koolson/Qure/master/IconSet/Color/United_States.png"),
+  Japan: GH_RAW("Koolson/Qure/master/IconSet/Color/Japan.png"),
+  Korea: GH_RAW("Koolson/Qure/master/IconSet/Color/Korea.png"),
+  Singapore: GH_RAW("Koolson/Qure/master/IconSet/Color/Singapore.png"),
+  ChinaMap: GH_RAW("Koolson/Qure/master/IconSet/Color/China_Map.png"),
+  China: GH_RAW("Koolson/Qure/master/IconSet/Color/China.png"),
+  UnitedKingdom: GH_RAW("Koolson/Qure/master/IconSet/Color/United_Kingdom.png"),
+  Germany: GH_RAW("Koolson/Qure/master/IconSet/Color/Germany.png"),
+  Malaysia: GH_RAW("Koolson/Qure/master/IconSet/Color/Malaysia.png"),
+  Turkey: GH_RAW("Koolson/Qure/master/IconSet/Color/Turkey.png"),
+  ChatGPT: GH_RAW("Koolson/Qure/master/IconSet/Color/ChatGPT.png"),
+  YouTube: GH_RAW("Koolson/Qure/master/IconSet/Color/YouTube.png"),
+  Bilibili3: GH_RAW("Koolson/Qure/master/IconSet/Color/bilibili_3.png"),
+  Bahamut: GH_RAW("Koolson/Qure/master/IconSet/Color/Bahamut.png"),
+  DisneyPlus: GH_RAW("Koolson/Qure/master/IconSet/Color/Disney+.png"),
+  Netflix: GH_RAW("Koolson/Qure/master/IconSet/Color/Netflix.png"),
+  TikTok: GH_RAW("Koolson/Qure/master/IconSet/Color/TikTok.png"),
+  Spotify: GH_RAW("Koolson/Qure/master/IconSet/Color/Spotify.png"),
+  Pixiv: GH_RAW("Koolson/Qure/master/IconSet/Color/Pixiv.png"),
+  HBO: GH_RAW("Koolson/Qure/master/IconSet/Color/HBO.png"),
+  TVB: GH_RAW("Koolson/Qure/master/IconSet/Color/TVB.png"),
+  PrimeVideo: GH_RAW("Koolson/Qure/master/IconSet/Color/Prime_Video.png"),
+  Hulu: GH_RAW("Koolson/Qure/master/IconSet/Color/Hulu.png"),
+  Telegram: GH_RAW("Koolson/Qure/master/IconSet/Color/Telegram.png"),
+  Line: GH_RAW("Koolson/Qure/master/IconSet/Color/Line.png"),
+  Game: GH_RAW("Koolson/Qure/master/IconSet/Color/Game.png"),
+  Reject: GH_RAW("Koolson/Qure/master/IconSet/Color/Reject.png"),
+  Advertising: GH_RAW("Koolson/Qure/master/IconSet/Color/Advertising.png"),
+  Apple2: GH_RAW("Koolson/Qure/master/IconSet/Color/Apple_2.png"),
+  GoogleSearch: GH_RAW("Koolson/Qure/master/IconSet/Color/Google_Search.png"),
+  Microsoft: GH_RAW("Koolson/Qure/master/IconSet/Color/Microsoft.png"),
+  GitHub: GH_RAW("Koolson/Qure/master/IconSet/Color/GitHub.png"),
+  JP: GH_RAW("Koolson/Qure/master/IconSet/Color/JP.png"),
+  Download: GH_RAW("Koolson/Qure/master/IconSet/Color/Download.png"),
+  StreamingCN: GH_RAW("Koolson/Qure/master/IconSet/Color/StreamingCN.png"),
+  StreamingNotCN: GH_RAW("Koolson/Qure/master/IconSet/Color/Streaming!CN.png")
+};
+
+const URLS = {
+  rulesets: {
+    applications: GH_RAW("DustinWin/ruleset_geodata/clash-ruleset/applications.list"),
+    ai: GH_RAW("dahaha-365/YaNet/dist/rulesets/mihomo/ai.list"),
+    adblock_mihomo_mrs: GH_RAW("217heidai/adblockfilters/main/rules/adblockmihomo.mrs"),
+    category_bank_jp_mrs: GH_RAW("MetaCubeX/meta-rules-dat/meta/geo/geosite/category-bank-jp.mrs")
+  },
+  geox: {
+    geoip: GH_RELEASE("MetaCubeX/meta-rules-dat/releases/download/latest/geoip-lite.dat"),
+    geosite: GH_RELEASE("MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"),
+    mmdb: GH_RELEASE("MetaCubeX/meta-rules-dat/releases/download/latest/country-lite.mmdb"),
+    asn: GH_RELEASE("MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb")
+  }
+};
+
+/* ===================== 配置（外链已替换为 GitHub Raw/Release 通过 ghproxy） ===================== */
+const Config = {
+  enable: true,
+  ruleOptions: {
+    apple: true, microsoft: true, github: true, google: true, openai: true, spotify: true,
+    youtube: true, bahamut: true, netflix: true, tiktok: true, disney: true, pixiv: true,
+    hbo: true, biliintl: true, tvb: true, hulu: true, primevideo: true, telegram: true,
+    line: true, whatsapp: true, games: true, japan: true, tracker: true, ads: true
+  },
+  preRules: [
+    "RULE-SET,applications,下载软件",
+    "PROCESS-NAME,SunloginClient,DIRECT",
+    "PROCESS-NAME,SunloginClient.exe,DIRECT",
+    "PROCESS-NAME,AnyDesk,DIRECT",
+    "PROCESS-NAME,AnyDesk.exe,DIRECT"
+  ],
+  regionOptions: {
+    excludeHighPercentage: true, ratioLimit: 2,
+    regions: [
+      { name: "HK香港", regex: /港|🇭🇰|hk|hongkong|hong kong/i, icon: ICONS.HongKong },
+      { name: "US美国", regex: /美|🇺🇸|us|united state|america/i, icon: ICONS.UnitedStates },
+      { name: "JP日本", regex: /日本|🇯🇵|jp|japan/i, icon: ICONS.Japan },
+      { name: "KR韩国", regex: /韩|🇰🇷|kr|korea/i, icon: ICONS.Korea },
+      { name: "SG新加坡", regex: /新加坡|🇸🇬|sg|singapore/i, icon: ICONS.Singapore },
+      { name: "CN中国大陆", regex: /中国|🇨🇳|cn|china/i, icon: ICONS.ChinaMap },
+      { name: "TW台湾省", regex: /台湾|🇹🇼|tw|taiwan|tai wan/i, icon: ICONS.China },
+      { name: "GB英国", regex: /英|🇬🇧|uk|united kingdom|great britain/i, icon: ICONS.UnitedKingdom },
+      { name: "DE德国", regex: /德国|🇩🇪|de|germany/i, icon: ICONS.Germany },
+      { name: "MY马来西亚", regex: /马来|my|malaysia/i, icon: ICONS.Malaysia },
+      { name: "TK土耳其", regex: /土耳其|🇹🇷|tk|turkey/i, icon: ICONS.Turkey }
+    ]
+  },
+  dns: {
+    enable: true, listen: ":1053", ipv6: true, "prefer-h3": true, "use-hosts": true, "use-system-hosts": true,
+    "respect-rules": true, "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
+    "fake-ip-filter": ["*", "+.lan", "+.local", "+.market.xiaomi.com"],
+    nameserver: ["https://120.53.53.53/dns-query", "https://223.5.5.5/dns-query"],
+    "proxy-server-nameserver": ["https://120.53.53.53/dns-query", "https://223.5.5.5/dns-query"],
+    "nameserver-policy": { "geosite:private": "system", "geosite:cn,steam@cn,category-games@cn,microsoft@cn,apple@cn": ["119.29.29.29", "223.5.5.5"] }
+  },
+  services: [
+    { id: "openai", rule: ["DOMAIN-SUFFIX,grazie.ai,国外AI", "DOMAIN-SUFFIX,grazie.aws.intellij.net,国外AI", "RULE-SET,ai,国外AI"], name: "国外AI", url: "https://chat.openai.com/cdn-cgi/trace", icon: ICONS.ChatGPT, ruleProvider: {name: "ai", url: URLS.rulesets.ai} },
+    { id: "youtube", rule: ["GEOSITE,youtube,YouTube"], name: "YouTube", url: "https://www.youtube.com/s/desktop/494dd881/img/favicon.ico", icon: ICONS.YouTube },
+    { id: "biliintl", rule: ["GEOSITE,biliintl,哔哩哔哩东南亚"], name: "哔哩哔哩东南亚", url: "https://www.bilibili.tv/", icon: ICONS.Bilibili3, proxiesOrder: ["默认节点", "直连"] },
+    { id: "bahamut", rule: ["GEOSITE,bahamut,巴哈姆特"], name: "巴哈姆特", url: "https://ani.gamer.com.tw/ajax/getdeviceid.php", icon: ICONS.Bahamut, proxiesOrder: ["默认节点", "直连"] },
+    { id: "disney", rule: ["GEOSITE,disney,Disney+"], name: "Disney+", url: "https://disney.api.edge.bamgrid.com/devices", icon: ICONS.DisneyPlus },
+    { id: "netflix", rule: ["GEOSITE,netflix,NETFLIX"], name: "NETFLIX", url: "https://api.fast.com/netflix/speedtest/v2?https=true", icon: ICONS.Netflix },
+    { id: "tiktok", rule: ["GEOSITE,tiktok,Tiktok"], name: "Tiktok", url: "https://www.tiktok.com/", icon: ICONS.TikTok },
+    { id: "spotify", rule: ["GEOSITE,spotify,Spotify"], name: "Spotify", url: "http://spclient.wg.spotify.com/signup/public/v1/account", icon: ICONS.Spotify },
+    { id: "pixiv", rule: ["GEOSITE,pixiv,Pixiv"], name: "Pixiv", url: "https://www.pixiv.net/favicon.ico", icon: ICONS.Pixiv },
+    { id: "hbo", rule: ["GEOSITE,hbo,HBO"], name: "HBO", url: "https://www.hbo.com/favicon.ico", icon: ICONS.HBO },
+    { id: "tvb", rule: ["GEOSITE,tvb,TVB"], name: "TVB", url: "https://www.tvb.com/logo_b.svg", icon: ICONS.TVB },
+    { id: "primevideo", rule: ["GEOSITE,primevideo,Prime Video"], name: "Prime Video", url: "https://m.media-amazon.com/images/G/01/digital/video/web/logo-min-remaster.png", icon: ICONS.PrimeVideo },
+    { id: "hulu", rule: ["GEOSITE,hulu,Hulu"], name: "Hulu", url: "https://auth.hulu.com/v4/web/password/authenticate", icon: ICONS.Hulu },
+    { id: "telegram", rule: ["GEOIP,telegram,Telegram"], name: "Telegram", url: "http://www.telegram.org/img/website_icon.svg", icon: ICONS.Telegram },
+    { id: "whatsapp", rule: ["GEOSITE,whatsapp,WhatsApp"], name: "WhatsApp", url: "https://web.whatsapp.com/data/manifest.json", icon: ICONS.Telegram },
+    { id: "line", rule: ["GEOSITE,line,Line"], name: "Line", url: "https://line.me/page-data/app-data.json", icon: ICONS.Line },
+    { id: "games", rule: ["GEOSITE,category-games@cn,国内网站", "GEOSITE,category-games,游戏专用"], name: "游戏专用", icon: ICONS.Game },
+    { id: "tracker", rule: ["GEOSITE,tracker,跟踪分析"], name: "跟踪分析", icon: ICONS.Reject, proxies: ["REJECT", "直连", "默认节点"] },
+    { id: "ads", rule: ["GEOSITE,category-ads-all,广告过滤", "RULE-SET,adblockmihomo,广告过滤"], name: "广告过滤", icon: ICONS.Advertising, proxies: ["REJECT", "直连", "默认节点"], ruleProvider: {name: "adblockmihomo", url: URLS.rulesets.adblock_mihomo_mrs, format: "mrs", behavior: "domain"} },
+    { id: "apple", rule: ["GEOSITE,apple-cn,苹果服务"], name: "苹果服务", url: "http://www.apple.com/library/test/success.html", icon: ICONS.Apple2 },
+    { id: "google", rule: ["GEOSITE,google,谷歌服务"], name: "谷歌服务", url: "http://www.google.com/generate_204", icon: ICONS.GoogleSearch },
+    { id: "microsoft", rule: ["GEOSITE,microsoft@cn,国内网站", "GEOSITE,microsoft,微软服务"], name: "微软服务", url: "http://www.msftconnecttest.com/connecttest.txt", icon: ICONS.Microsoft },
+    { id: "github", rule: ["GEOSITE,github,Github"], name: "Github", url: "https://github.com/robots.txt", icon: ICONS.GitHub },
+    { id: "japan", rule: ["RULE-SET,category-bank-jp,日本网站", "GEOIP,jp,日本网站,no-resolve"], name: "日本网站", url: "https://r.r10s.jp/com/img/home/logo/touch.png", icon: ICONS.JP, ruleProvider: {name: "category-bank-jp", url: URLS.rulesets.category_bank_jp_mrs, format: "mrs", behavior: "domain"} }
+  ],
+  system: {
+    "allow-lan": true, "bind-address": "*", mode: "rule",
+    profile: { "store-selected": true, "store-fake-ip": true },
+    "unified-delay": true, "tcp-concurrent": true, "keep-alive-interval": 1800,
+    "find-process-mode": "strict", "geodata-mode": true, "geodata-loader": "memconservative",
+    "geo-auto-update": true, "geo-update-interval": 24,
+    sniffer: {
+      enable: true, "force-dns-mapping": true, "parse-pure-ip": false, "override-destination": true,
+      sniff: { TLS: { ports: [443, 8443] }, HTTP: { ports: [80, "8080-8880"] }, QUIC: { ports: [443, 8443] } },
+      "skip-src-address": ["127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
+      "force-domain": ["+.google.com", "+.googleapis.com", "+.googleusercontent.com", "+.youtube.com", "+.facebook.com", "+.messenger.com", "+.fbcdn.net", "fbcdn-a.akamaihd.net"],
+      "skip-domain": ["Mijia Cloud", "+.oray.com"]
+    },
+    ntp: { enable: true, "write-to-system": false, server: "cn.ntp.org.cn" },
+    "geox-url": {
+      geoip: URLS.geox.geoip,
+      geosite: URLS.geox.geosite,
+      mmdb: URLS.geox.mmdb,
+      asn: URLS.geox.asn
+    }
+  },
+  common: {
+    ruleProvider: { type: "http", format: "yaml", interval: 86400 },
+    proxyGroup: { interval: 300, timeout: 3000, url: "http://cp.cloudflare.com/generate_204", lazy: true, "max-failed-times": 3, hidden: false },
+    defaultProxyGroups: [
+      { name: "下载软件", icon: ICONS.Download, proxies: ["直连", "REJECT", "默认节点", "国内网站"] },
+      { name: "其他外网", icon: ICONS.StreamingNotCN, proxies: ["默认节点", "国内网站"] },
+      { name: "国内网站", url: "http://wifi.vivo.com.cn/generate_204", icon: ICONS.StreamingCN, proxies: ["直连", "默认节点"] }
+    ],
+    postRules: ["GEOSITE,private,DIRECT", "GEOIP,private,DIRECT,no-resolve", "GEOSITE,cn,国内网站", "GEOIP,cn,国内网站,no-resolve", "MATCH,其他外网"]
+  }
+};
+
+/* ===================== 配置处理（生成代理组与规则） ===================== */
+CentralManager.prototype.processConfiguration = function (config) {
+  if (!config || typeof config !== "object") throw new ConfigurationError("processConfiguration: 配置对象无效");
+  let safeConfig;
+  try {
+    safeConfig = JSON.parse(JSON.stringify(config));
+    if (!safeConfig || typeof safeConfig !== "object") throw new Error("深拷贝结果无效");
+  } catch (e) {
+    throw new ConfigurationError(`配置对象无法深拷贝: ${e && e.message ? e.message : "unknown error"}`);
+  }
+
+  try {
+    this.state.config = safeConfig;
+    this.stats?.reset?.();
+    this.successTracker?.reset?.();
+  } catch (e) { Logger.warn("重置统计信息失败:", e.message); }
+
+  const proxyCount = Array.isArray(safeConfig?.proxies) ? safeConfig.proxies.length : 0;
+  const providerCount = (typeof safeConfig?.["proxy-providers"] === "object" && safeConfig["proxy-providers"] !== null)
+    ? Object.keys(safeConfig["proxy-providers"]).length : 0;
+  if (proxyCount === 0 && providerCount === 0) throw new ConfigurationError("未检测到任何代理节点或代理提供者");
+
+  try {
+    if (Config?.system && typeof Config.system === "object") Object.assign(safeConfig, Config.system);
+    if (Config?.dns && typeof Config.dns === "object") safeConfig.dns = Config.dns;
+  } catch (e) { Logger.warn("应用系统配置失败:", e.message); }
+
+  if (!Config || !Config.enable) {
+    Logger.info("配置处理已禁用，返回原始配置"); return safeConfig;
+  }
+
+  const regionProxyGroups = [];
+  let otherProxyGroups = [];
+  try {
+    if (Array.isArray(safeConfig.proxies)) {
+      otherProxyGroups = safeConfig.proxies.filter(p => p && typeof p.name === "string").map(p => p.name);
+    }
+  } catch (e) { Logger.warn("处理代理列表失败:", e.message); otherProxyGroups = []; }
+
+  try {
+    if (Config.regionOptions && Array.isArray(Config.regionOptions.regions)) {
+      Config.regionOptions.regions.forEach(region => {
+        if (!region || typeof region !== "object") return;
+        try {
+          const names = Utils.filterProxiesByRegion(safeConfig.proxies || [], region);
+          if (Array.isArray(names) && names.length > 0) {
+            regionProxyGroups.push({
+              ...(Config.common?.proxyGroup || {}), name: region.name || "Unknown",
+              type: "url-test", tolerance: 50, icon: region.icon || "", proxies: names
+            });
+            otherProxyGroups = otherProxyGroups.filter(n => !names.includes(n));
+          }
+        } catch (e) { Logger.debug(`处理地区 ${region.name || "unknown"} 失败:`, e.message); }
+      });
+    }
+  } catch (e) { Logger.warn("处理地区代理组失败:", e.message); }
+
+  let regionGroupNames = [];
+  try {
+    regionGroupNames = regionProxyGroups.filter(g => g && g.name).map(g => g.name);
+    if (otherProxyGroups.length > 0) regionGroupNames.push("其他节点");
+    regionGroupNames = Array.from(new Set(regionGroupNames));
+  } catch (e) { Logger.warn("构建区域组名称列表失败:", e.message); regionGroupNames = []; }
+
+  try {
+    safeConfig["proxy-groups"] = [{
+      ...(Config.common?.proxyGroup || {}), name: "默认节点", type: "select",
+      proxies: [...regionGroupNames, "直连"],
+      icon: ICONS.Proxy
+    }];
+  } catch (e) { Logger.warn("初始化代理组失败:", e.message); safeConfig["proxy-groups"] = []; }
+
+  try {
+    safeConfig.proxies = Array.isArray(safeConfig?.proxies) ? safeConfig.proxies : [];
+    if (!safeConfig.proxies.some(p => p && p.name === "直连")) {
+      safeConfig.proxies.push({ name: "直连", type: "direct" });
+    }
+  } catch (e) { Logger.warn("添加直连代理失败:", e.message); }
+
+  const ruleProviders = new Map();
+  const rules = [];
+  try {
+    if (Config.common?.ruleProvider && typeof Config.common.ruleProvider === "object") {
+      ruleProviders.set("applications", {
+        ...Config.common.ruleProvider,
+        behavior: "classical", format: "text",
+        url: URLS.rulesets.applications,
+        path: "./ruleset/DustinWin/applications.list"
+      });
+    }
+    if (Array.isArray(Config.preRules)) rules.push(...Config.preRules);
+    if (typeof Utils.createServiceGroups === "function") {
+      Utils.createServiceGroups(safeConfig, regionGroupNames, ruleProviders, rules);
+    }
+  } catch (e) { Logger.warn("处理服务规则失败:", e.message); }
+
+  try {
+    if (Config.common && Array.isArray(Config.common.defaultProxyGroups)) {
+      Config.common.defaultProxyGroups.forEach(group => {
+        if (group && typeof group === "object" && group.name) {
+          try {
+            safeConfig["proxy-groups"].push({
+              ...(Config.common?.proxyGroup || {}),
+              name: group.name || "Unknown",
+              type: "select",
+              proxies: [...(Array.isArray(group.proxies) ? group.proxies : []), ...regionGroupNames],
+              url: group.url || (Config.common?.proxyGroup?.url || ""),
+              icon: group.icon || ""
+            });
+          } catch (e) { Logger.debug(`添加默认代理组失败 (${group.name}):`, e.message); }
+        }
+      });
+    }
+  } catch (e) { Logger.warn("添加默认代理组失败:", e.message); }
+
+  try { if (regionProxyGroups.length > 0) safeConfig["proxy-groups"] = (safeConfig["proxy-groups"] || []).concat(regionProxyGroups); }
+  catch (e) { Logger.warn("添加区域代理组失败:", e.message); }
+
+  try {
+    if (otherProxyGroups.length > 0) {
+      safeConfig["proxy-groups"].push({
+        ...(Config.common?.proxyGroup || {}),
+        name: "其他节点", type: "select", proxies: otherProxyGroups,
+        icon: ICONS.WorldMap
+      });
+    }
+  } catch (e) { Logger.warn("添加其他节点组失败:", e.message); }
+
+  try {
+    if (Config.common && Array.isArray(Config.common.postRules)) rules.push(...Config.common.postRules);
+    safeConfig.rules = rules;
+  } catch (e) { Logger.warn("添加后置规则失败:", e.message); safeConfig.rules = rules; }
+
+  try { if (ruleProviders.size > 0) safeConfig["rule-providers"] = Object.fromEntries(ruleProviders); }
+  catch (e) { Logger.warn("添加规则提供者失败:", e.message); }
+
+  return safeConfig;
+};
+
+/* ===================== AI 数据存取（存储接口优先：$persistentStore/localStorage） ===================== */
+CentralManager.prototype.loadAIDBFromFile = function () {
+  return new Promise((resolve) => {
+    try {
+      let raw = "";
+      let storage = null;
+      try {
+        if (typeof $persistentStore !== "undefined" && $persistentStore) storage = $persistentStore;
+        else if (PLATFORM.isBrowser && window.localStorage) storage = window.localStorage;
+      } catch (e) { Logger.debug("存储检测失败:", e.message); }
+      if (storage) {
+        try {
+          if (typeof storage.getItem === "function") raw = storage.getItem("ai_node_data") || "";
+          else if (typeof storage.read === "function") raw = storage.read("ai_node_data") || "";
+        } catch (e) { Logger.warn("读取存储数据失败:", e.message); raw = ""; }
+      }
+      if (raw && typeof raw === "string" && raw.trim()) {
+        try {
+          const data = JSON.parse(raw);
+          if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+            let loadedCount = 0;
+            Object.entries(data).forEach(([id, stats]) => {
+              if (id && typeof id === "string" && stats && typeof stats === "object") {
+                try { this.state.metrics.set(id, Array.isArray(stats) ? stats : [stats]); loadedCount++; }
+                catch (e) { Logger.debug(`加载节点数据失败 (${id}):`, e.message); }
+              }
+            });
+            Logger.info(`成功加载AI节点数据，共${loadedCount}条记录`);
+          } else { Logger.warn("AI数据格式无效，预期为对象"); }
+        } catch (e) {
+          Logger.error("AI数据解析失败:", e && e.stack ? e.stack : e);
+          try {
+            if (typeof $persistentStore !== "undefined" && $persistentStore.write) $persistentStore.write("", "ai_node_data");
+            else if (PLATFORM.isBrowser && window.localStorage?.removeItem) window.localStorage.removeItem("ai_node_data");
+          } catch (delErr) { Logger.warn("删除损坏数据失败:", delErr.message); }
+        }
+      }
+    } catch (e) { Logger.error("AI数据加载失败:", e && e.stack ? e.stack : e); }
+    finally { resolve(); }
+  });
+};
+
+CentralManager.prototype.saveAIDBToFile = function () {
+  try {
+    if (!this.state || !this.state.metrics) { Logger.warn("无法保存AI数据: state.metrics 未初始化"); return; }
+    const data = Object.fromEntries(this.state.metrics.entries());
+    if (!data || Object.keys(data).length === 0) { Logger.debug("没有AI数据需要保存"); return; }
+    const raw = JSON.stringify(data, null, 2);
+    if (!raw || raw.length === 0) { Logger.warn("序列化AI数据失败: 结果为空"); return; }
+    let saved = false;
+    try {
+      if (typeof $persistentStore !== "undefined" && typeof $persistentStore?.write === "function") {
+        $persistentStore.write(raw, "ai_node_data"); saved = true;
+      } else if (PLATFORM.isBrowser && typeof window.localStorage?.setItem === "function") {
+        window.localStorage.setItem("ai_node_data", raw); saved = true;
+      }
+      if (saved) Logger.debug(`AI数据保存成功，共${Object.keys(data).length}条记录`);
+      else Logger.warn("无法保存AI数据: 未找到可用的存储接口");
+    } catch (e) { Logger.error("AI数据保存到存储失败:", e && e.message ? e.message : e); }
+  } catch (e) { Logger.error("AI数据保存失败:", e && e.stack ? e.stack : e); }
+};
+
+/* ===================== 节点多指标测试（真实/模拟） ===================== */
+CentralManager.prototype.testNodeMultiMetrics = async function (node) {
+  const cacheKey = `nodeMetrics:${node.id}`;
+  const cached = this.lruCache.get(cacheKey);
+  if (cached) return cached;
+
+  const timeout = CONSTANTS.NODE_TEST_TIMEOUT || 5000;
+  const probe = async () => {
+    const probeUrl =
+      node.proxyUrl ||
+      node.probeUrl ||
+      (node.server ? `http://${node.server}` : null);
+
+    let tcpLatencyMs = null;
+    if (PLATFORM.isNode && node.server) {
+      try {
+        const [host, portStr] = node.server.split(":");
+        const port = parseInt(portStr || "80", 10) || 80;
+        tcpLatencyMs = await this.throughputEstimator.tcpConnectLatency(host, port, timeout);
+      } catch { tcpLatencyMs = null; }
+    }
+
+    if (!probeUrl) throw new Error("无探测URL，使用模拟测试");
+    const start = Date.now();
+    let response;
+    try { response = await this._safeFetch(probeUrl, { method: "GET" }, timeout); }
+    catch (e) {
+      return { latency: timeout, loss: 1, jitter: 100, bytes: 0, bps: 0, __hardFail: true };
+    }
+    const latency = Date.now() - start;
+
+    const measure = await this.throughputEstimator.measureResponse(response, timeout);
+    const bytes = measure.bytes || 0;
+    const jitter = Math.max(0, Math.min(CONSTANTS.JITTER_CLAMP_MS, measure.jitter || 0));
+
+    const bps = this.throughputEstimator.bpsFromBytesLatency({ bytes, latency });
+
+    const finalLatency = (typeof tcpLatencyMs === "number" && tcpLatencyMs > 0 && tcpLatencyMs < latency)
+      ? tcpLatencyMs : latency;
+
+    return { latency: finalLatency, loss: 0, jitter, bytes, bps };
+  };
+
+  try {
+    const result = await Utils.retry(() => probe(), 2, 200);
+    try { this.lruCache.set(cacheKey, result, 60000); } catch {}
+    return result;
+  } catch (e) {
+    Logger.debug("真实网络探测失败，使用模拟数据:", e && e.message ? e.message : e);
+    return new Promise(resolve => {
+      setTimeout(() => {
+        const latency = Math.random() * 500 + 50;
+        const loss = Math.random() * 0.1;
+        const jitter = Math.random() * 50;
+        const bytes = Math.floor(Math.random() * 32 * 1024);
+        const bps = this.throughputEstimator.bpsFromBytesLatency({ bytes, latency });
+        const simulated = { latency, loss, jitter, bytes, bps, __simulated: true };
+        try { this.lruCache.set(cacheKey, simulated, 60000); } catch {}
+        resolve(simulated);
+      }, Math.random() * 500);
+    });
+  }
+};
+
+/* ===================== 指标管理/可用性追踪/吞吐估计 ===================== */
 class MetricsManager {
   constructor(state) { this.state = state; }
   append(nodeId, metrics) {
@@ -1769,7 +1922,7 @@ class ThroughputEstimator {
     try {
       if (response?.body && typeof response.body.getReader === "function") {
         const reader = response.body.getReader();
-        const maxBytes = 64 * 1024; // limit to 64KB
+        const maxBytes = 64 * 1024; // 读取上限 64KB
         const readStart = Date.now();
         while (true) {
           const { done, value } = await reader.read();
@@ -1804,112 +1957,13 @@ class ThroughputEstimator {
   }
 }
 
-// ================= Config (original shape preserved) =================
-const Config = {
-  enable: true,
-  ruleOptions: {
-    apple: true, microsoft: true, github: true, google: true, openai: true, spotify: true,
-    youtube: true, bahamut: true, netflix: true, tiktok: true, disney: true, pixiv: true,
-    hbo: true, biliintl: true, tvb: true, hulu: true, primevideo: true, telegram: true,
-    line: true, whatsapp: true, games: true, japan: true, tracker: true, ads: true
-  },
-  preRules: [
-    "RULE-SET,applications,下载软件",
-    "PROCESS-NAME,SunloginClient,DIRECT",
-    "PROCESS-NAME,SunloginClient.exe,DIRECT",
-    "PROCESS-NAME,AnyDesk,DIRECT",
-    "PROCESS-NAME,AnyDesk.exe,DIRECT"
-  ],
-  regionOptions: {
-    excludeHighPercentage: true, ratioLimit: 2,
-    regions: [
-      { name: "HK香港", regex: /港|🇭🇰|hk|hongkong|hong kong/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Hong_Kong.png" },
-      { name: "US美国", regex: /美|🇺🇸|us|united state|america/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/United_States.png" },
-      { name: "JP日本", regex: /日本|🇯🇵|jp|japan/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Japan.png" },
-      { name: "KR韩国", regex: /韩|🇰🇷|kr|korea/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Korea.png" },
-      { name: "SG新加坡", regex: /新加坡|🇸🇬|sg|singapore/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Singapore.png" },
-      { name: "CN中国大陆", regex: /中国|🇨🇳|cn|china/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/China_Map.png" },
-      { name: "TW台湾省", regex: /台湾|🇹🇼|tw|taiwan|tai wan/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/China.png" },
-      { name: "GB英国", regex: /英|🇬🇧|uk|united kingdom|great britain/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/United_Kingdom.png" },
-      { name: "DE德国", regex: /德国|🇩🇪|de|germany/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Germany.png" },
-      { name: "MY马来西亚", regex: /马来|my|malaysia/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Malaysia.png" },
-      { name: "TK土耳其", regex: /土耳其|🇹🇷|tk|turkey/i, icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Turkey.png" }
-    ]
-  },
-  dns: {
-    enable: true, listen: ":1053", ipv6: true, "prefer-h3": true, "use-hosts": true, "use-system-hosts": true,
-    "respect-rules": true, "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
-    "fake-ip-filter": ["*", "+.lan", "+.local", "+.market.xiaomi.com"],
-    nameserver: ["https://120.53.53.53/dns-query", "https://223.5.5.5/dns-query"],
-    "proxy-server-nameserver": ["https://120.53.53.53/dns-query", "https://223.5.5.5/dns-query"],
-    "nameserver-policy": { "geosite:private": "system", "geosite:cn,steam@cn,category-games@cn,microsoft@cn,apple@cn": ["119.29.29.29", "223.5.5.5"] }
-  },
-  services: [
-    { id: "openai", rule: ["DOMAIN-SUFFIX,grazie.ai,国外AI", "DOMAIN-SUFFIX,grazie.aws.intellij.net,国外AI", "RULE-SET,ai,国外AI"], name: "国外AI", url: "https://chat.openai.com/cdn-cgi/trace", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/ChatGPT.png", ruleProvider: {name: "ai", url: "https://github.com/dahaha-365/YaNet/raw/refs/heads/dist/rulesets/mihomo/ai.list"} },
-    { id: "youtube", rule: ["GEOSITE,youtube,YouTube"], name: "YouTube", url: "https://www.youtube.com/s/desktop/494dd881/img/favicon.ico", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/YouTube.png" },
-    { id: "biliintl", rule: ["GEOSITE,biliintl,哔哩哔哩东南亚"], name: "哔哩哔哩东南亚", url: "https://www.bilibili.tv/", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/bilibili_3.png", proxiesOrder: ["默认节点", "直连"] },
-    { id: "bahamut", rule: ["GEOSITE,bahamut,巴哈姆特"], name: "巴哈姆特", url: "https://ani.gamer.com.tw/ajax/getdeviceid.php", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Bahamut.png", proxiesOrder: ["默认节点", "直连"] },
-    { id: "disney", rule: ["GEOSITE,disney,Disney+"], name: "Disney+", url: "https://disney.api.edge.bamgrid.com/devices", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Disney+.png" },
-    { id: "netflix", rule: ["GEOSITE,netflix,NETFLIX"], name: "NETFLIX", url: "https://api.fast.com/netflix/speedtest/v2?https=true", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Netflix.png" },
-    { id: "tiktok", rule: ["GEOSITE,tiktok,Tiktok"], name: "Tiktok", url: "https://www.tiktok.com/", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/TikTok.png" },
-    { id: "spotify", rule: ["GEOSITE,spotify,Spotify"], name: "Spotify", url: "http://spclient.wg.spotify.com/signup/public/v1/account", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Spotify.png" },
-    { id: "pixiv", rule: ["GEOSITE,pixiv,Pixiv"], name: "Pixiv", url: "https://www.pixiv.net/favicon.ico", icon: "https://play-lh.googleusercontent.com/8pFuLOHF62ADcN0ISUAyEueA5G8IF49mX_6Az6pQNtokNVHxIVbS1L2NM62H-k02rLM=w240-h480-rw" },
-    { id: "hbo", rule: ["GEOSITE,hbo,HBO"], name: "HBO", url: "https://www.hbo.com/favicon.ico", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/HBO.png" },
-    { id: "tvb", rule: ["GEOSITE,tvb,TVB"], name: "TVB", url: "https://www.tvb.com/logo_b.svg", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/TVB.png" },
-    { id: "primevideo", rule: ["GEOSITE,primevideo,Prime Video"], name: "Prime Video", url: "https://m.media-amazon.com/images/G/01/digital/video/web/logo-min-remaster.png", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Prime_Video.png" },
-    { id: "hulu", rule: ["GEOSITE,hulu,Hulu"], name: "Hulu", url: "https://auth.hulu.com/v4/web/password/authenticate", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Hulu.png" },
-    { id: "telegram", rule: ["GEOIP,telegram,Telegram"], name: "Telegram", url: "http://www.telegram.org/img/website_icon.svg", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Telegram.png" },
-    { id: "whatsapp", rule: ["GEOSITE,whatsapp,WhatsApp"], name: "WhatsApp", url: "https://web.whatsapp.com/data/manifest.json", icon: "https://static.whatsapp.net/rsrc.php/v3/yP/r/rYZqPCBaG70.png" },
-    { id: "line", rule: ["GEOSITE,line,Line"], name: "Line", url: "https://line.me/page-data/app-data.json", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Line.png" },
-    { id: "games", rule: ["GEOSITE,category-games@cn,国内网站", "GEOSITE,category-games,游戏专用"], name: "游戏专用", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Game.png" },
-    { id: "tracker", rule: ["GEOSITE,tracker,跟踪分析"], name: "跟踪分析", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Reject.png", proxies: ["REJECT", "直连", "默认节点"] },
-    { id: "ads", rule: ["GEOSITE,category-ads-all,广告过滤", "RULE-SET,adblockmihomo,广告过滤"], name: "广告过滤", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Advertising.png", proxies: ["REJECT", "直连", "默认节点"], ruleProvider: {name: "adblockmihomo", url: "https://github.com/217heidai/adblockfilters/raw/refs/heads/main/rules/adblockmihomo.mrs", format: "mrs", behavior: "domain"} },
-    { id: "apple", rule: ["GEOSITE,apple-cn,苹果服务"], name: "苹果服务", url: "http://www.apple.com/library/test/success.html", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Apple_2.png" },
-    { id: "google", rule: ["GEOSITE,google,谷歌服务"], name: "谷歌服务", url: "http://www.google.com/generate_204", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Google_Search.png" },
-    { id: "microsoft", rule: ["GEOSITE,microsoft@cn,国内网站", "GEOSITE,microsoft,微软服务"], name: "微软服务", url: "http://www.msftconnecttest.com/connecttest.txt", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Microsoft.png" },
-    { id: "github", rule: ["GEOSITE,github,Github"], name: "Github", url: "https://github.com/robots.txt", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/GitHub.png" },
-    { id: "japan", rule: ["RULE-SET,category-bank-jp,日本网站", "GEOIP,jp,日本网站,no-resolve"], name: "日本网站", url: "https://r.r10s.jp/com/img/home/logo/touch.png", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/JP.png", ruleProvider: {name: "category-bank-jp", url: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/category-bank-jp.mrs", format: "mrs", behavior: "domain"} }
-  ],
-  system: {
-    "allow-lan": true, "bind-address": "*", mode: "rule",
-    profile: { "store-selected": true, "store-fake-ip": true },
-    "unified-delay": true, "tcp-concurrent": true, "keep-alive-interval": 1800,
-    "find-process-mode": "strict", "geodata-mode": true, "geodata-loader": "memconservative",
-    "geo-auto-update": true, "geo-update-interval": 24,
-    sniffer: {
-      enable: true, "force-dns-mapping": true, "parse-pure-ip": false, "override-destination": true,
-      sniff: { TLS: { ports: [443, 8443] }, HTTP: { ports: [80, "8080-8880"] }, QUIC: { ports: [443, 8443] } },
-      "skip-src-address": ["127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
-      "force-domain": ["+.google.com", "+.googleapis.com", "+.googleusercontent.com", "+.youtube.com", "+.facebook.com", "+.messenger.com", "+.fbcdn.net", "fbcdn-a.akamaihd.net"],
-      "skip-domain": ["Mijia Cloud", "+.oray.com"]
-    },
-    ntp: { enable: true, "write-to-system": false, server: "cn.ntp.org.cn" },
-    "geox-url": {
-      geoip: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip-lite.dat",
-      geosite: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
-      mmdb: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country-lite.mmdb",
-      asn: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"
-    }
-  },
-  common: {
-    ruleProvider: { type: "http", format: "yaml", interval: 86400 },
-    proxyGroup: { interval: 300, timeout: 3000, url: "http://cp.cloudflare.com/generate_204", lazy: true, "max-failed-times": 3, hidden: false },
-    defaultProxyGroups: [
-      { name: "下载软件", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Download.png", proxies: ["直连", "REJECT", "默认节点", "国内网站"] },
-      { name: "其他外网", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/Streaming!CN.png", proxies: ["默认节点", "国内网站"] },
-      { name: "国内网站", url: "http://wifi.vivo.com.cn/generate_204", icon: "https://fastly.jsdelivr.net/gh/Koolson/Qure/IconSet/Color/StreamingCN.png", proxies: ["直连", "默认节点"] }
-    ],
-    postRules: ["GEOSITE,private,DIRECT", "GEOIP,private,DIRECT,no-resolve", "GEOSITE,cn,国内网站", "GEOIP,cn,国内网站,no-resolve", "MATCH,其他外网"]
-  }
-};
-
-// ================= Main =================
+/* ===================== 主流程入口 ===================== */
 function main(config) {
   const centralManager = CentralManager.getInstance();
   return centralManager.processConfiguration(config);
 }
 
-// CommonJS/ESM compatibility (optional)
+/* ===================== CommonJS/ESM 兼容导出 ===================== */
 if (typeof module !== "undefined") {
   module.exports = { main, CentralManager, NodeManager, Config };
 }
