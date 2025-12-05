@@ -5,8 +5,8 @@
  * - 智能节点选择，事件驱动，无周期轮询
  * - 指标流/可用性信号/吞吐量测量统一加固
  * - 出站/入站协议与业务感知优化
- * - GitHub 资源统一镜像加速（健康检测 + 原站回退 + 轮换测试目标）
- * - 隐私模式（可选）：关闭外部地理查询，仅基于域名/本地推断
+ * - GitHub 资源统一镜像加速（健康检测 + 原站优先 + 回退 + 轮换测试目标）
+ * - 隐私模式（可选）：关闭外部地理查询，仅基于域名/本地推断（统一入口）
  * - 新区域自动分组：扫描节点名称中的地区语义，自动生成对应“url-test”分组（零干预）
  */
 
@@ -129,7 +129,7 @@ class AppState {
   }
 }
 
-/* ===================== LRU 缓存（自适应清理） ===================== */
+/* ===================== LRU 缓存（自适应清理加强） ===================== */
 class LRUCache {
   constructor({ maxSize = CONSTANTS.LRU_CACHE_MAX_SIZE, ttl = CONSTANTS.LRU_CACHE_TTL } = {}) {
     this.cache = new Map();
@@ -179,6 +179,9 @@ class LRUCache {
     const ratio = this.cache.size / this.maxSize;
     if (ratio > CONSTANTS.CACHE_CLEANUP_THRESHOLD) {
       this._cleanupExpiredEntries(CONSTANTS.CACHE_CLEANUP_BATCH_SIZE);
+    }
+    if (ratio > 0.7) {
+      this._cleanupExpiredEntries(CONSTANTS.CACHE_CLEANUP_BATCH_SIZE * 2);
     }
     const now = Date.now();
     if (this.cache.has(key)) {
@@ -231,7 +234,7 @@ class SuccessRateTracker {
   record(success, { hardFail = false } = {}) {
     this.totalCount++;
     if (success) { this.successCount++; this.hardFailStreak = 0; }
-    else { if (hardFail) this.hardFailStreak++; }
+    else { if (hardFail) this.hardFailStreak = Math.min(this.hardFailStreak + 1, 100); }
   }
   get rate() { return this.totalCount ? this.successCount / this.totalCount : 0; }
   reset() { this.successCount = 0; this.totalCount = 0; this.hardFailStreak = 0; }
@@ -327,10 +330,10 @@ const Utils = {
     if (!Utils.isIPv4(ip)) return false;
     try {
       const parts = ip.split(".").map(n => parseInt(n, 10));
-      if (parts[0] === 10) return true; // 10.0.0.0/8
-      if (parts[0] === 127) return true; // 127.0.0.0/8
-      if (parts[0] === 192 && parts[1] === 168) return true; // 192.168.0.0/16
-      if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true; // 172.16.0.0/12
+      if (parts[0] === 10) return true;
+      if (parts[0] === 127) return true;
+      if (parts[0] === 192 && parts[1] === 168) return true;
+      if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
       return false;
     } catch { return false; }
   },
@@ -340,7 +343,7 @@ const Utils = {
       .filter(p => {
         if (!p || typeof p.name !== "string") return false;
         const m = p.name.match(/(?:[xX✕✖⨉]|倍率)(\d+\.?\d*)/i);
-        const mult = m ? parseFloat(m[1]) : 0;
+        const mult = m ? parseFloat(m[1]) : 1; // 默认倍率 1
         return p.name.match(region.regex) && mult <= Config.regionOptions.ratioLimit;
       })
       .map(p => p.name);
@@ -374,10 +377,10 @@ const Utils = {
 
 /* ===================== GitHub 访问加速（镜像健康检测 + Raw/Release + 多目标） ===================== */
 const GH_MIRRORS = [
+  "", // 原始 GitHub（优先）
   "https://mirror.ghproxy.com/",
   "https://github.moeyy.xyz/",
-  "https://ghproxy.com/",
-  "" // 原始 GitHub（作为最后回退）
+  "https://ghproxy.com/"
 ];
 const GH_TEST_TARGETS = [
   "https://raw.githubusercontent.com/github/gitignore/main/Node.gitignore",
@@ -437,10 +440,12 @@ async function selectBestMirror(runtimeFetch) {
     const healthy = results.filter(r => r.ok).map(r => r.m);
 
     let chosen = "";
-    if (healthy.length > 0) {
-      chosen = healthy.includes("") ? "" : healthy[0];
+    if (healthy.includes("")) {
+      chosen = ""; // 原站健康优先
+    } else if (healthy.length > 0) {
+      chosen = healthy[0];
     } else {
-      chosen = __ghSelected ?? GH_MIRRORS[0];
+      chosen = __ghSelected ?? "";
     }
 
     __ghSelected = chosen;
@@ -454,6 +459,165 @@ async function selectBestMirror(runtimeFetch) {
 
   return __ghSelectLock;
 }
+
+/* ===================== 资源（图标/规则/Geo 数据）统一前缀常量（延迟绑定） ===================== */
+const ICONS = {
+  Proxy: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Proxy.png"),
+  WorldMap: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/World_Map.png"),
+  HongKong: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Hong_Kong.png"),
+  UnitedStates: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/United_States.png"),
+  Japan: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Japan.png"),
+  Korea: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Korea.png"),
+  Singapore: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Singapore.png"),
+  ChinaMap: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/China_Map.png"),
+  China: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/China.png"),
+  UnitedKingdom: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/United_Kingdom.png"),
+  Germany: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Germany.png"),
+  Malaysia: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Malaysia.png"),
+  Turkey: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Turkey.png"),
+  ChatGPT: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/ChatGPT.png"),
+  YouTube: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/YouTube.png"),
+  Bilibili3: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/bilibili_3.png"),
+  Bahamut: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Bahamut.png"),
+  DisneyPlus: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Disney+.png"),
+  Netflix: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Netflix.png"),
+  TikTok: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/TikTok.png"),
+  Spotify: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Spotify.png"),
+  Pixiv: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Pixiv.png"),
+  HBO: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/HBO.png"),
+  TVB: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/TVB.png"),
+  PrimeVideo: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Prime_Video.png"),
+  Hulu: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Hulu.png"),
+  Telegram: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Telegram.png"),
+  Line: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Line.png"),
+  Game: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Game.png"),
+  Reject: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Reject.png"),
+  Advertising: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Advertising.png"),
+  Apple2: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Apple_2.png"),
+  GoogleSearch: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Google_Search.png"),
+  Microsoft: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Microsoft.png"),
+  GitHub: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/GitHub.png"),
+  JP: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/JP.png"),
+  Download: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Download.png"),
+  StreamingCN: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/StreamingCN.png"),
+  StreamingNotCN: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Streaming!CN.png")
+};
+function ICON_VAL(fn) { try { return typeof fn === "function" ? fn() : fn; } catch { return ""; } }
+
+const URLS = {
+  rulesets: {
+    applications: () => GH_RAW_URL("DustinWin/ruleset_geodata/clash-ruleset/applications.list"),
+    ai: () => GH_RAW_URL("dahaha-365/YaNet/dist/rulesets/mihomo/ai.list"),
+    adblock_mihomo_mrs: () => GH_RAW_URL("217heidai/adblockfilters/main/rules/adblockmihomo.mrs"),
+    category_bank_jp_mrs: () => GH_RAW_URL("MetaCubeX/meta-rules-dat/meta/geo/geosite/category-bank-jp.mrs")
+  },
+  geox: {
+    geoip: () => GH_RELEASE_URL("MetaCubeX/meta-rules-dat/releases/download/latest/geoip-lite.dat"),
+    geosite: () => GH_RELEASE_URL("MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"),
+    mmdb: () => GH_RELEASE_URL("MetaCubeX/meta-rules-dat/releases/download/latest/country-lite.mmdb"),
+    asn: () => GH_RELEASE_URL("MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb")
+  }
+};
+
+/* ===================== 基础配置（保持原有） ===================== */
+const Config = {
+  enable: true,
+  privacy: { geoExternalLookup: true },
+  ruleOptions: {
+    apple: true, microsoft: true, github: true, google: true, openai: true, spotify: true,
+    youtube: true, bahamut: true, netflix: true, tiktok: true, disney: true, pixiv: true,
+    hbo: true, biliintl: true, tvb: true, hulu: true, primevideo: true, telegram: true,
+    line: true, whatsapp: true, games: true, japan: true, tracker: true, ads: true
+  },
+  preRules: [
+    "RULE-SET,applications,下载软件",
+    "PROCESS-NAME,SunloginClient,DIRECT",
+    "PROCESS-NAME,SunloginClient.exe,DIRECT",
+    "PROCESS-NAME,AnyDesk,DIRECT",
+    "PROCESS-NAME,AnyDesk.exe,DIRECT"
+  ],
+  regionOptions: {
+    excludeHighPercentage: true, ratioLimit: 2,
+    regions: [
+      { name: "HK香港", regex: /港|🇭🇰|hk|hongkong|hong kong/i, icon: ICON_VAL(ICONS.HongKong) },
+      { name: "US美国", regex: /美|🇺🇸|us|united states|america/i, icon: ICON_VAL(ICONS.UnitedStates) },
+      { name: "JP日本", regex: /日本|🇯🇵|jp|japan/i, icon: ICON_VAL(ICONS.Japan) },
+      { name: "KR韩国", regex: /韩|🇰🇷|kr|korea/i, icon: ICON_VAL(ICONS.Korea) },
+      { name: "SG新加坡", regex: /新加坡|🇸🇬|sg|singapore/i, icon: ICON_VAL(ICONS.Singapore) },
+      { name: "CN中国大陆", regex: /中国|🇨🇳|cn|china/i, icon: ICON_VAL(ICONS.ChinaMap) },
+      { name: "TW台湾省", regex: /台湾|🇹🇼|tw|taiwan|tai wan/i, icon: ICON_VAL(ICONS.China) },
+      { name: "GB英国", regex: /英|🇬🇧|uk|united kingdom|great britain/i, icon: ICON_VAL(ICONS.UnitedKingdom) },
+      { name: "DE德国", regex: /德国|🇩🇪|de|germany/i, icon: ICON_VAL(ICONS.Germany) },
+      { name: "MY马来西亚", regex: /马来|my|malaysia/i, icon: ICON_VAL(ICONS.Malaysia) },
+      { name: "TR土耳其", regex: /土耳其|🇹🇷|tr|turkey/i, icon: ICON_VAL(ICONS.Turkey) }
+    ]
+  },
+  dns: {
+    enable: true, listen: ":1053", ipv6: true, "prefer-h3": true, "use-hosts": true, "use-system-hosts": true,
+    "respect-rules": true, "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
+    "fake-ip-filter": ["*", "+.lan", "+.local", "+.market.xiaomi.com"],
+    nameserver: ["https://120.53.53.53/dns-query", "https://223.5.5.5/dns-query"],
+    "proxy-server-nameserver": ["https://120.53.53.53/dns-query", "https://223.5.5.5/dns-query"],
+    "nameserver-policy": { "geosite:private": "system", "geosite:cn,steam@cn,category-games@cn,microsoft@cn,apple@cn": ["119.29.29.29", "223.5.5.5"] }
+  },
+  services: [
+    { id: "openai", rule: ["DOMAIN-SUFFIX,grazie.ai,国外AI", "DOMAIN-SUFFIX,grazie.aws.intellij.net,国外AI", "RULE-SET,ai,国外AI"], name: "国外AI", url: "https://chat.openai.com/cdn-cgi/trace", icon: ICON_VAL(ICONS.ChatGPT), ruleProvider: {name: "ai", url: URLS.rulesets.ai()} },
+    { id: "youtube", rule: ["GEOSITE,youtube,YouTube"], name: "YouTube", url: "https://www.youtube.com/s/desktop/494dd881/img/favicon.ico", icon: ICON_VAL(ICONS.YouTube) },
+    { id: "biliintl", rule: ["GEOSITE,biliintl,哔哩哔哩东南亚"], name: "哔哩哔哩东南亚", url: "https://www.bilibili.tv/", icon: ICON_VAL(ICONS.Bilibili3), proxiesOrder: ["默认节点", "直连"] },
+    { id: "bahamut", rule: ["GEOSITE,bahamut,巴哈姆特"], name: "巴哈姆特", url: "https://ani.gamer.com.tw/ajax/getdeviceid.php", icon: ICON_VAL(ICONS.Bahamut), proxiesOrder: ["默认节点", "直连"] },
+    { id: "disney", rule: ["GEOSITE,disney,Disney+"], name: "Disney+", url: "https://disney.api.edge.bamgrid.com/devices", icon: ICON_VAL(ICONS.DisneyPlus) },
+    { id: "netflix", rule: ["GEOSITE,netflix,NETFLIX"], name: "NETFLIX", url: "https://api.fast.com/netflix/speedtest/v2?https=true", icon: ICON_VAL(ICONS.Netflix) },
+    { id: "tiktok", rule: ["GEOSITE,tiktok,Tiktok"], name: "Tiktok", url: "https://www.tiktok.com/", icon: ICON_VAL(ICONS.TikTok) },
+    { id: "spotify", rule: ["GEOSITE,spotify,Spotify"], name: "Spotify", url: "http://spclient.wg.spotify.com/signup/public/v1/account", icon: ICON_VAL(ICONS.Spotify) },
+    { id: "pixiv", rule: ["GEOSITE,pixiv,Pixiv"], name: "Pixiv", url: "https://www.pixiv.net/favicon.ico", icon: ICON_VAL(ICONS.Pixiv) },
+    { id: "hbo", rule: ["GEOSITE,hbo,HBO"], name: "HBO", url: "https://www.hbo.com/favicon.ico", icon: ICON_VAL(ICONS.HBO) },
+    { id: "tvb", rule: ["GEOSITE,tvb,TVB"], name: "TVB", url: "https://www.tvb.com/logo_b.svg", icon: ICON_VAL(ICONS.TVB) },
+    { id: "primevideo", rule: ["GEOSITE,primevideo,Prime Video"], name: "Prime Video", url: "https://m.media-amazon.com/images/G/01/digital/video/web/logo-min-remaster.png", icon: ICON_VAL(ICONS.PrimeVideo) },
+    { id: "hulu", rule: ["GEOSITE,hulu,Hulu"], name: "Hulu", url: "https://auth.hulu.com/v4/web/password/authenticate", icon: ICON_VAL(ICONS.Hulu) },
+    { id: "telegram", rule: ["GEOIP,telegram,Telegram"], name: "Telegram", url: "http://www.telegram.org/img/website_icon.svg", icon: ICON_VAL(ICONS.Telegram) },
+    { id: "whatsapp", rule: ["GEOSITE,whatsapp,WhatsApp"], name: "WhatsApp", url: "https://web.whatsapp.com/data/manifest.json", icon: ICON_VAL(ICONS.Telegram) },
+    { id: "line", rule: ["GEOSITE,line,Line"], name: "Line", url: "https://line.me/page-data/app-data.json", icon: ICON_VAL(ICONS.Line) },
+    { id: "games", rule: ["GEOSITE,category-games@cn,国内网站", "GEOSITE,category-games,游戏专用"], name: "游戏专用", icon: ICON_VAL(ICONS.Game) },
+    { id: "tracker", rule: ["GEOSITE,tracker,跟踪分析"], name: "跟踪分析", icon: ICON_VAL(ICONS.Reject), proxies: ["REJECT", "直连", "默认节点"] },
+    { id: "ads", rule: ["GEOSITE,category-ads-all,广告过滤", "RULE-SET,adblockmihomo,广告过滤"], name: "广告过滤", icon: ICON_VAL(ICONS.Advertising), proxies: ["REJECT", "直连", "默认节点"], ruleProvider: {name: "adblockmihomo", url: URLS.rulesets.adblock_mihomo_mrs(), format: "mrs", behavior: "domain"} },
+    { id: "apple", rule: ["GEOSITE,apple-cn,苹果服务"], name: "苹果服务", url: "http://www.apple.com/library/test/success.html", icon: ICON_VAL(ICONS.Apple2) },
+    { id: "google", rule: ["GEOSITE,google,谷歌服务"], name: "谷歌服务", url: "http://www.google.com/generate_204", icon: ICON_VAL(ICONS.GoogleSearch) },
+    { id: "microsoft", rule: ["GEOSITE,microsoft@cn,国内网站", "GEOSITE,microsoft,微软服务"], name: "微软服务", url: "http://www.msftconnecttest.com/connecttest.txt", icon: ICON_VAL(ICONS.Microsoft) },
+    { id: "github", rule: ["GEOSITE,github,Github"], name: "Github", url: "https://github.com/robots.txt", icon: ICON_VAL(ICONS.GitHub) },
+    { id: "japan", rule: ["RULE-SET,category-bank-jp,日本网站", "GEOIP,jp,日本网站,no-resolve"], name: "日本网站", url: "https://r.r10s.jp/com/img/home/logo/touch.png", icon: ICON_VAL(ICONS.JP), ruleProvider: {name: "category-bank-jp", url: URLS.rulesets.category_bank_jp_mrs(), format: "mrs", behavior: "domain"} }
+  ],
+  system: {
+    "allow-lan": true, "bind-address": "*", mode: "rule",
+    profile: { "store-selected": true, "store-fake-ip": true },
+    "unified-delay": true, "tcp-concurrent": true, "keep-alive-interval": 1800,
+    "find-process-mode": "strict", "geodata-mode": true, "geodata-loader": "memconservative",
+    "geo-auto-update": true, "geo-update-interval": 24,
+    sniffer: {
+      enable: true, "force-dns-mapping": true, "parse-pure-ip": false, "override-destination": true,
+      sniff: { TLS: { ports: [443, 8443] }, HTTP: { ports: [80, "8080-8880"] }, QUIC: { ports: [443, 8443] } },
+      "skip-src-address": ["127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
+      "force-domain": ["+.google.com", "+.googleapis.com", "+.googleusercontent.com", "+.youtube.com", "+.facebook.com", "+.messenger.com", "+.fbcdn.net", "fbcdn-a.akamaihd.net"],
+      "skip-domain": ["Mijia Cloud", "+.oray.com"]
+    },
+    ntp: { enable: true, "write-to-system": false, server: "cn.ntp.org.cn" },
+    "geox-url": {
+      geoip: URLS.geox.geoip(),
+      geosite: URLS.geox.geosite(),
+      mmdb: URLS.geox.mmdb(),
+      asn: URLS.geox.asn()
+    }
+  },
+  common: {
+    ruleProvider: { type: "http", format: "yaml", interval: 86400 },
+    proxyGroup: { interval: 300, timeout: 3000, url: "http://cp.cloudflare.com/generate_204", lazy: true, "max-failed-times": 3, hidden: false },
+    defaultProxyGroups: [
+      { name: "下载软件", icon: ICON_VAL(ICONS.Download), proxies: ["直连", "REJECT", "默认节点", "国内网站"] },
+      { name: "其他外网", icon: ICON_VAL(ICONS.StreamingNotCN), proxies: ["默认节点", "国内网站"] },
+      { name: "国内网站", url: "http://wifi.vivo.com.cn/generate_204", icon: ICON_VAL(ICONS.StreamingCN), proxies: ["直连", "默认节点"] }
+    ],
+    postRules: ["GEOSITE,private,DIRECT", "GEOIP,private,DIRECT,no-resolve", "GEOSITE,cn,国内网站", "GEOIP,cn,国内网站,no-resolve", "MATCH,其他外网"]
+  }
+};
 
 /* ===================== 节点管理器 ===================== */
 class NodeManager extends EventEmitter {
@@ -579,32 +743,28 @@ class NodeManager extends EventEmitter {
   }
 }
 
-/* ===================== 新区域自动分组管理器 ===================== */
+/* ===================== 新区域自动分组管理器（正则校准） ===================== */
 class RegionAutoManager {
   constructor() {
     this.knownRegexMap = this._buildKnownRegexMap();
   }
   _buildKnownRegexMap() {
     return [
-      { key: "香港", regex: /港|🇭🇰|hk|hong\s?kong/i, icon: ICONS.HongKong, name: "HK香港" },
-      { key: "美国", regex: /美|🇺🇸|us|united\s?states|america/i, icon: ICONS.UnitedStates, name: "US美国" },
-      { key: "日本", regex: /日本|🇯🇵|jp|japan/i, icon: ICONS.Japan, name: "JP日本" },
-      { key: "韩国", regex: /韩|🇰🇷|kr|korea/i, icon: ICONS.Korea, name: "KR韩国" },
-      { key: "新加坡", regex: /新加坡|🇸🇬|sg|singapore/i, icon: ICONS.Singapore, name: "SG新加坡" },
-      { key: "中国大陆", regex: /中国|🇨🇳|cn|china/i, icon: ICONS.ChinaMap, name: "CN中国大陆" },
-      { key: "台湾省", regex: /台湾|🇹🇼|tw|taiwan/i, icon: ICONS.China, name: "TW台湾省" },
-      { key: "英国", regex: /英|🇬🇧|uk|united\s?kingdom|great\s?britain/i, icon: ICONS.UnitedKingdom, name: "GB英国" },
-      { key: "德国", regex: /德国|🇩🇪|de|germany/i, icon: ICONS.Germany, name: "DE德国" },
-      { key: "马来西亚", regex: /马来|🇲🇾|my|malaysia/i, icon: ICONS.Malaysia, name: "MY马来西亚" },
-      { key: "土耳其", regex: /土耳其|🇹🇷|tk|turkey/i, icon: ICONS.Turkey, name: "TK土耳其" }
+      { key: "香港", regex: /港|🇭🇰|hk|hong\s?kong/i, icon: ICON_VAL(ICONS.HongKong), name: "HK香港" },
+      { key: "美国", regex: /美|🇺🇸|us|united\s?states|america/i, icon: ICON_VAL(ICONS.UnitedStates), name: "US美国" },
+      { key: "日本", regex: /日本|🇯🇵|jp|japan/i, icon: ICON_VAL(ICONS.Japan), name: "JP日本" },
+      { key: "韩国", regex: /韩|🇰🇷|kr|korea/i, icon: ICON_VAL(ICONS.Korea), name: "KR韩国" },
+      { key: "新加坡", regex: /新加坡|🇸🇬|sg|singapore/i, icon: ICON_VAL(ICONS.Singapore), name: "SG新加坡" },
+      { key: "中国大陆", regex: /中国|🇨🇳|cn|china/i, icon: ICON_VAL(ICONS.ChinaMap), name: "CN中国大陆" },
+      { key: "台湾省", regex: /台湾|🇹🇼|tw|taiwan/i, icon: ICON_VAL(ICONS.China), name: "TW台湾省" },
+      { key: "英国", regex: /英|🇬🇧|uk|united\s?kingdom|great\s?britain/i, icon: ICON_VAL(ICONS.UnitedKingdom), name: "GB英国" },
+      { key: "德国", regex: /德国|🇩🇪|de|germany/i, icon: ICON_VAL(ICONS.Germany), name: "DE德国" },
+      { key: "马来西亚", regex: /马来|🇲🇾|my|malaysia/i, icon: ICON_VAL(ICONS.Malaysia), name: "MY马来西亚" },
+      { key: "土耳其", regex: /土耳其|🇹🇷|tr|turkey/i, icon: ICON_VAL(ICONS.Turkey), name: "TR土耳其" }
     ];
   }
-  _normalizeName(name) {
-    return String(name || "").trim();
-  }
-  _hasRegion(regions, name) {
-    return Array.isArray(regions) && regions.some(r => r && r.name === name);
-  }
+  _normalizeName(name) { return String(name || "").trim(); }
+  _hasRegion(regions, name) { return Array.isArray(regions) && regions.some(r => r && r.name === name); }
   discoverRegionsFromProxies(proxies) {
     const found = new Map();
     if (!Array.isArray(proxies)) return found;
@@ -622,16 +782,16 @@ class RegionAutoManager {
         hints.forEach(h => {
           const hNorm = h.toLowerCase();
           const whitelist = {
-            es: { name: "ES西班牙", icon: ICONS.WorldMap },
-            ca: { name: "CA加拿大", icon: ICONS.WorldMap },
-            au: { name: "AU澳大利亚", icon: ICONS.WorldMap },
-            fr: { name: "FR法国", icon: ICONS.WorldMap },
-            it: { name: "IT意大利", icon: ICONS.WorldMap },
-            nl: { name: "NL荷兰", icon: ICONS.WorldMap },
-            ru: { name: "RU俄罗斯", icon: ICONS.WorldMap },
-            in: { name: "IN印度", icon: ICONS.WorldMap },
-            br: { name: "BR巴西", icon: ICONS.WorldMap },
-            ar: { name: "AR阿根廷", icon: ICONS.WorldMap }
+            es: { name: "ES西班牙", icon: ICON_VAL(ICONS.WorldMap) },
+            ca: { name: "CA加拿大", icon: ICON_VAL(ICONS.WorldMap) },
+            au: { name: "AU澳大利亚", icon: ICON_VAL(ICONS.WorldMap) },
+            fr: { name: "FR法国", icon: ICON_VAL(ICONS.WorldMap) },
+            it: { name: "IT意大利", icon: ICON_VAL(ICONS.WorldMap) },
+            nl: { name: "NL荷兰", icon: ICON_VAL(ICONS.WorldMap) },
+            ru: { name: "RU俄罗斯", icon: ICON_VAL(ICONS.WorldMap) },
+            in: { name: "IN印度", icon: ICON_VAL(ICONS.WorldMap) },
+            br: { name: "BR巴西", icon: ICON_VAL(ICONS.WorldMap) },
+            ar: { name: "AR阿根廷", icon: ICON_VAL(ICONS.WorldMap) }
           };
           if (whitelist[hNorm]) {
             const item = whitelist[hNorm];
@@ -648,11 +808,7 @@ class RegionAutoManager {
     const merged = Array.isArray(configRegions) ? [...configRegions] : [];
     for (const region of discoveredMap.values()) {
       if (!this._hasRegion(merged, region.name)) {
-        merged.push({
-          name: region.name,
-          regex: region.regex,
-          icon: region.icon || ICONS.WorldMap
-        });
+        merged.push({ name: region.name, regex: region.regex, icon: region.icon || ICON_VAL(ICONS.WorldMap) });
       }
     }
     return merged;
@@ -672,7 +828,7 @@ class RegionAutoManager {
           name: region.name || "Unknown",
           type: "url-test",
           tolerance: 50,
-          icon: region.icon || ICONS.WorldMap,
+          icon: region.icon || ICON_VAL(ICONS.WorldMap),
           proxies: names
         });
         otherProxyNames = otherProxyNames.filter(n => !names.includes(n));
@@ -736,6 +892,10 @@ class CentralManager extends EventEmitter {
       }
     }
     return { _fetch, _AbortController };
+  }
+
+  isGeoExternalLookupEnabled() {
+    return !(Config?.privacy && Config.privacy.geoExternalLookup === false);
   }
 
   async _safeFetch(url, options = {}, timeout = CONSTANTS.GEO_INFO_TIMEOUT) {
@@ -907,7 +1067,7 @@ class CentralManager extends EventEmitter {
     const timeoutThreshold = (CONSTANTS.NODE_TEST_TIMEOUT || 5000) * 2;
 
     const hardFail = !!metrics.__hardFail;
-    const success = !!(metrics && !isSimulated && latency > 0 && latency < timeoutThreshold && !hardFail);
+    const success = !!(metrics && !hardFail && latency > 0 && latency < timeoutThreshold && !isSimulated);
     this.availabilityTracker.record(node.id, success, { hardFail });
 
     let score = 0;
@@ -916,9 +1076,8 @@ class CentralManager extends EventEmitter {
     let geoInfo = null;
     try {
       const nodeIp = (node.server && typeof node.server === "string") ? node.server.split(":")[0] : null;
-      const privacyOff = !(Config?.privacy && Config.privacy.geoExternalLookup === false);
       if (Utils.isIPv4(nodeIp) && !Utils.isPrivateIP(nodeIp)) {
-        geoInfo = privacyOff ? await this.getGeoInfo(nodeIp) : this._getFallbackGeoInfo();
+        geoInfo = this.isGeoExternalLookupEnabled() ? await this.getGeoInfo(nodeIp) : this._getFallbackGeoInfo();
       }
     } catch (e) { Logger.debug(`获取节点地理信息失败 (${node.id}):`, e.message); }
 
@@ -945,8 +1104,7 @@ class CentralManager extends EventEmitter {
 
   async handleRequestWithGeoRouting(targetIp) {
     if (!targetIp || !this.state.config.proxies || this.state.config.proxies.length === 0) { Logger.warn("无法进行地理路由: 缺少目标IP或代理节点"); return; }
-    const privacyOff = !(Config?.privacy && Config.privacy.geoExternalLookup === false);
-    const targetGeo = privacyOff ? await this.getGeoInfo(targetIp) : this._getFallbackGeoInfo();
+    const targetGeo = this.isGeoExternalLookupEnabled() ? await this.getGeoInfo(targetIp) : this._getFallbackGeoInfo();
     if (!targetGeo) {
       Logger.warn("无法获取目标IP地理信息，使用默认路由");
       await this.nodeManager.switchToBestNode(this.state.config.proxies);
@@ -965,7 +1123,10 @@ class CentralManager extends EventEmitter {
     const thresholdTime = Date.now() - CONSTANTS.NODE_EVALUATION_THRESHOLD;
     proxies.forEach(node => {
       const status = this.state.nodes.get(node.id);
+      const samples = (this.state.metrics.get(node.id) || []).length;
+      const protectedBySample = samples < CONSTANTS.MIN_SAMPLE_SIZE; // 最小样本保护窗口
       if (!status || status.lastEvaluated < thresholdTime || status.score < CONSTANTS.NODE_CLEANUP_THRESHOLD) {
+        if (protectedBySample) return; // 样本不足不清理，保持零干预平滑
         this.state.nodes.delete(node.id);
         this.state.metrics.delete(node.id);
         this.nodeManager.nodeQuality.delete(node.id);
@@ -993,14 +1154,13 @@ class CentralManager extends EventEmitter {
     } catch {}
 
     const clientIP = reqCtx.clientIP || reqCtx.headers?.["X-Forwarded-For"] || reqCtx.headers?.["Remote-Address"];
-    const privacyOff = !(Config?.privacy && Config.privacy.geoExternalLookup === false);
-    const clientGeo = clientIP ? (privacyOff ? await this.getGeoInfo(clientIP) : this._getFallbackGeoInfo(hostname)) : null;
+    const clientGeo = clientIP ? (this.isGeoExternalLookupEnabled() ? await this.getGeoInfo(clientIP) : this._getFallbackGeoInfo(hostname)) : null;
 
     let targetGeo = null;
     try {
       if (hostname && Utils.isValidDomain(hostname)) {
         const targetIP = await this.resolveDomainToIP(hostname);
-        if (targetIP) targetGeo = privacyOff ? await this.getGeoInfo(targetIP) : this._getFallbackGeoInfo(hostname);
+        if (targetIP) targetGeo = this.isGeoExternalLookupEnabled() ? await this.getGeoInfo(targetIP) : this._getFallbackGeoInfo(hostname);
       }
     } catch {}
 
@@ -1200,7 +1360,7 @@ class CentralManager extends EventEmitter {
     if (Utils.isPrivateIP(ip)) { return { country: "Local", region: "Local" }; }
     const cached = this.geoInfoCache.get(ip); if (cached) { Logger.debug(`使用缓存的地理信息: ${ip} -> ${cached.country}`); return cached; }
 
-    if (Config?.privacy && Config.privacy.geoExternalLookup === false) {
+    if (!this.isGeoExternalLookupEnabled()) {
       const downgraded = this._getFallbackGeoInfo(domain);
       this.geoInfoCache.set(ip, downgraded, CONSTANTS.GEO_FALLBACK_TTL);
       return downgraded;
@@ -1468,7 +1628,7 @@ class CentralManager extends EventEmitter {
     try {
       safeConfig["proxy-groups"] = [{
         ...(Config.common?.proxyGroup || {}), name: "默认节点", type: "select",
-        proxies: [...regionGroupNames, "直连"], icon: ICONS.Proxy
+        proxies: [...regionGroupNames, "直连"], icon: ICON_VAL(ICONS.Proxy)
       }];
     } catch (e) { Logger.warn("初始化代理组失败:", e.message); safeConfig["proxy-groups"] = []; }
 
@@ -1484,7 +1644,7 @@ class CentralManager extends EventEmitter {
         ruleProviders.set("applications", {
           ...Config.common.ruleProvider,
           behavior: "classical", format: "text",
-          url: URLS.rulesets.applications,
+          url: URLS.rulesets.applications(),
           path: "./ruleset/DustinWin/applications.list"
         });
       }
@@ -1519,7 +1679,7 @@ class CentralManager extends EventEmitter {
         safeConfig["proxy-groups"].push({
           ...(Config.common?.proxyGroup || {}),
           name: "其他节点", type: "select", proxies: otherProxyNames,
-          icon: ICONS.WorldMap
+          icon: ICON_VAL(ICONS.WorldMap)
         });
       }
     } catch (e) { Logger.warn("添加其他节点组失败:", e.message); }
@@ -1539,7 +1699,8 @@ class CentralManager extends EventEmitter {
         proxies: [
           { id: "n1", name: "香港HK x1", type: "http", server: "1.2.3.4:80" },
           { id: "n2", name: "US美国✕2", type: "http", server: "5.6.7.8:80" },
-          { id: "n3", name: "ES西班牙 x1", type: "http", server: "9.9.9.9:80" }
+          { id: "n3", name: "ES西班牙 x1", type: "http", server: "9.9.9.9:80" },
+          { id: "n4", name: "TR土耳其 x1", type: "http", server: "10.20.30.40:80" }
         ]
       };
       const out = this.processConfiguration(demoConfig);
@@ -1547,6 +1708,7 @@ class CentralManager extends EventEmitter {
       if (!groups.includes("HK香港")) throw new Error("未生成香港分组");
       if (!groups.includes("US美国")) throw new Error("未生成美国分组");
       if (!groups.includes("ES西班牙")) throw new Error("未自动识别ES西班牙分组");
+      if (!groups.includes("TR土耳其")) throw new Error("未识别土耳其分组");
       Logger.info("自检通过：自动地区分组生成正常");
     } catch (e) { Logger.error("自检失败:", e.message); }
   }
@@ -1629,164 +1791,6 @@ class ThroughputEstimator {
     return Math.min(CONSTANTS.THROUGHPUT_SOFT_CAP_BPS, bps);
   }
 }
-
-/* ===================== 资源（图标/规则/Geo 数据）统一前缀常量 ===================== */
-const ICONS = {
-  Proxy: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Proxy.png"),
-  WorldMap: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/World_Map.png"),
-  HongKong: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Hong_Kong.png"),
-  UnitedStates: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/United_States.png"),
-  Japan: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Japan.png"),
-  Korea: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Korea.png"),
-  Singapore: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Singapore.png"),
-  ChinaMap: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/China_Map.png"),
-  China: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/China.png"),
-  UnitedKingdom: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/United_Kingdom.png"),
-  Germany: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Germany.png"),
-  Malaysia: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Malaysia.png"),
-  Turkey: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Turkey.png"),
-  ChatGPT: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/ChatGPT.png"),
-  YouTube: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/YouTube.png"),
-  Bilibili3: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/bilibili_3.png"),
-  Bahamut: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Bahamut.png"),
-  DisneyPlus: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Disney+.png"),
-  Netflix: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Netflix.png"),
-  TikTok: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/TikTok.png"),
-  Spotify: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Spotify.png"),
-  Pixiv: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Pixiv.png"),
-  HBO: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/HBO.png"),
-  TVB: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/TVB.png"),
-  PrimeVideo: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Prime_Video.png"),
-  Hulu: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Hulu.png"),
-  Telegram: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Telegram.png"),
-  Line: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Line.png"),
-  Game: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Game.png"),
-  Reject: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Reject.png"),
-  Advertising: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Advertising.png"),
-  Apple2: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Apple_2.png"),
-  GoogleSearch: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Google_Search.png"),
-  Microsoft: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Microsoft.png"),
-  GitHub: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/GitHub.png"),
-  JP: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/JP.png"),
-  Download: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Download.png"),
-  StreamingCN: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/StreamingCN.png"),
-  StreamingNotCN: GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Streaming!CN.png")
-};
-
-const URLS = {
-  rulesets: {
-    applications: GH_RAW_URL("DustinWin/ruleset_geodata/clash-ruleset/applications.list"),
-    ai: GH_RAW_URL("dahaha-365/YaNet/dist/rulesets/mihomo/ai.list"),
-    adblock_mihomo_mrs: GH_RAW_URL("217heidai/adblockfilters/main/rules/adblockmihomo.mrs"),
-    category_bank_jp_mrs: GH_RAW_URL("MetaCubeX/meta-rules-dat/meta/geo/geosite/category-bank-jp.mrs")
-  },
-  geox: {
-    geoip: GH_RELEASE_URL("MetaCubeX/meta-rules-dat/releases/download/latest/geoip-lite.dat"),
-    geosite: GH_RELEASE_URL("MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"),
-    mmdb: GH_RELEASE_URL("MetaCubeX/meta-rules-dat/releases/download/latest/country-lite.mmdb"),
-    asn: GH_RELEASE_URL("MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb")
-  }
-};
-
-/* ===================== 基础配置（保持原有） ===================== */
-const Config = {
-  enable: true,
-  privacy: { geoExternalLookup: true },
-  ruleOptions: {
-    apple: true, microsoft: true, github: true, google: true, openai: true, spotify: true,
-    youtube: true, bahamut: true, netflix: true, tiktok: true, disney: true, pixiv: true,
-    hbo: true, biliintl: true, tvb: true, hulu: true, primevideo: true, telegram: true,
-    line: true, whatsapp: true, games: true, japan: true, tracker: true, ads: true
-  },
-  preRules: [
-    "RULE-SET,applications,下载软件",
-    "PROCESS-NAME,SunloginClient,DIRECT",
-    "PROCESS-NAME,SunloginClient.exe,DIRECT",
-    "PROCESS-NAME,AnyDesk,DIRECT",
-    "PROCESS-NAME,AnyDesk.exe,DIRECT"
-  ],
-  regionOptions: {
-    excludeHighPercentage: true, ratioLimit: 2,
-    regions: [
-      { name: "HK香港", regex: /港|🇭🇰|hk|hongkong|hong kong/i, icon: ICONS.HongKong },
-      { name: "US美国", regex: /美|🇺🇸|us|united state|america/i, icon: ICONS.UnitedStates },
-      { name: "JP日本", regex: /日本|🇯🇵|jp|japan/i, icon: ICONS.Japan },
-      { name: "KR韩国", regex: /韩|🇰🇷|kr|korea/i, icon: ICONS.Korea },
-      { name: "SG新加坡", regex: /新加坡|🇸🇬|sg|singapore/i, icon: ICONS.Singapore },
-      { name: "CN中国大陆", regex: /中国|🇨🇳|cn|china/i, icon: ICONS.ChinaMap },
-      { name: "TW台湾省", regex: /台湾|🇹🇼|tw|taiwan|tai wan/i, icon: ICONS.China },
-      { name: "GB英国", regex: /英|🇬🇧|uk|united kingdom|great britain/i, icon: ICONS.UnitedKingdom },
-      { name: "DE德国", regex: /德国|🇩🇪|de|germany/i, icon: ICONS.Germany },
-      { name: "MY马来西亚", regex: /马来|my|malaysia/i, icon: ICONS.Malaysia },
-      { name: "TK土耳其", regex: /土耳其|🇹🇷|tk|turkey/i, icon: ICONS.Turkey }
-    ]
-  },
-  dns: {
-    enable: true, listen: ":1053", ipv6: true, "prefer-h3": true, "use-hosts": true, "use-system-hosts": true,
-    "respect-rules": true, "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
-    "fake-ip-filter": ["*", "+.lan", "+.local", "+.market.xiaomi.com"],
-    nameserver: ["https://120.53.53.53/dns-query", "https://223.5.5.5/dns-query"],
-    "proxy-server-nameserver": ["https://120.53.53.53/dns-query", "https://223.5.5.5/dns-query"],
-    "nameserver-policy": { "geosite:private": "system", "geosite:cn,steam@cn,category-games@cn,microsoft@cn,apple@cn": ["119.29.29.29", "223.5.5.5"] }
-  },
-  services: [
-    { id: "openai", rule: ["DOMAIN-SUFFIX,grazie.ai,国外AI", "DOMAIN-SUFFIX,grazie.aws.intellij.net,国外AI", "RULE-SET,ai,国外AI"], name: "国外AI", url: "https://chat.openai.com/cdn-cgi/trace", icon: ICONS.ChatGPT, ruleProvider: {name: "ai", url: URLS.rulesets.ai} },
-    { id: "youtube", rule: ["GEOSITE,youtube,YouTube"], name: "YouTube", url: "https://www.youtube.com/s/desktop/494dd881/img/favicon.ico", icon: ICONS.YouTube },
-    { id: "biliintl", rule: ["GEOSITE,biliintl,哔哩哔哩东南亚"], name: "哔哩哔哩东南亚", url: "https://www.bilibili.tv/", icon: ICONS.Bilibili3, proxiesOrder: ["默认节点", "直连"] },
-    { id: "bahamut", rule: ["GEOSITE,bahamut,巴哈姆特"], name: "巴哈姆特", url: "https://ani.gamer.com.tw/ajax/getdeviceid.php", icon: ICONS.Bahamut, proxiesOrder: ["默认节点", "直连"] },
-    { id: "disney", rule: ["GEOSITE,disney,Disney+"], name: "Disney+", url: "https://disney.api.edge.bamgrid.com/devices", icon: ICONS.DisneyPlus },
-    { id: "netflix", rule: ["GEOSITE,netflix,NETFLIX"], name: "NETFLIX", url: "https://api.fast.com/netflix/speedtest/v2?https=true", icon: ICONS.Netflix },
-    { id: "tiktok", rule: ["GEOSITE,tiktok,Tiktok"], name: "Tiktok", url: "https://www.tiktok.com/", icon: ICONS.TikTok },
-    { id: "spotify", rule: ["GEOSITE,spotify,Spotify"], name: "Spotify", url: "http://spclient.wg.spotify.com/signup/public/v1/account", icon: ICONS.Spotify },
-    { id: "pixiv", rule: ["GEOSITE,pixiv,Pixiv"], name: "Pixiv", url: "https://www.pixiv.net/favicon.ico", icon: ICONS.Pixiv },
-    { id: "hbo", rule: ["GEOSITE,hbo,HBO"], name: "HBO", url: "https://www.hbo.com/favicon.ico", icon: ICONS.HBO },
-    { id: "tvb", rule: ["GEOSITE,tvb,TVB"], name: "TVB", url: "https://www.tvb.com/logo_b.svg", icon: ICONS.TVB },
-    { id: "primevideo", rule: ["GEOSITE,primevideo,Prime Video"], name: "Prime Video", url: "https://m.media-amazon.com/images/G/01/digital/video/web/logo-min-remaster.png", icon: ICONS.PrimeVideo },
-    { id: "hulu", rule: ["GEOSITE,hulu,Hulu"], name: "Hulu", url: "https://auth.hulu.com/v4/web/password/authenticate", icon: ICONS.Hulu },
-    { id: "telegram", rule: ["GEOIP,telegram,Telegram"], name: "Telegram", url: "http://www.telegram.org/img/website_icon.svg", icon: ICONS.Telegram },
-    { id: "whatsapp", rule: ["GEOSITE,whatsapp,WhatsApp"], name: "WhatsApp", url: "https://web.whatsapp.com/data/manifest.json", icon: ICONS.Telegram },
-    { id: "line", rule: ["GEOSITE,line,Line"], name: "Line", url: "https://line.me/page-data/app-data.json", icon: ICONS.Line },
-    { id: "games", rule: ["GEOSITE,category-games@cn,国内网站", "GEOSITE,category-games,游戏专用"], name: "游戏专用", icon: ICONS.Game },
-    { id: "tracker", rule: ["GEOSITE,tracker,跟踪分析"], name: "跟踪分析", icon: ICONS.Reject, proxies: ["REJECT", "直连", "默认节点"] },
-    { id: "ads", rule: ["GEOSITE,category-ads-all,广告过滤", "RULE-SET,adblockmihomo,广告过滤"], name: "广告过滤", icon: ICONS.Advertising, proxies: ["REJECT", "直连", "默认节点"], ruleProvider: {name: "adblockmihomo", url: URLS.rulesets.adblock_mihomo_mrs, format: "mrs", behavior: "domain"} },
-    { id: "apple", rule: ["GEOSITE,apple-cn,苹果服务"], name: "苹果服务", url: "http://www.apple.com/library/test/success.html", icon: ICONS.Apple2 },
-    { id: "google", rule: ["GEOSITE,google,谷歌服务"], name: "谷歌服务", url: "http://www.google.com/generate_204", icon: ICONS.GoogleSearch },
-    { id: "microsoft", rule: ["GEOSITE,microsoft@cn,国内网站", "GEOSITE,microsoft,微软服务"], name: "微软服务", url: "http://www.msftconnecttest.com/connecttest.txt", icon: ICONS.Microsoft },
-    { id: "github", rule: ["GEOSITE,github,Github"], name: "Github", url: "https://github.com/robots.txt", icon: ICONS.GitHub },
-    { id: "japan", rule: ["RULE-SET,category-bank-jp,日本网站", "GEOIP,jp,日本网站,no-resolve"], name: "日本网站", url: "https://r.r10s.jp/com/img/home/logo/touch.png", icon: ICONS.JP, ruleProvider: {name: "category-bank-jp", url: URLS.rulesets.category_bank_jp_mrs, format: "mrs", behavior: "domain"} }
-  ],
-  system: {
-    "allow-lan": true, "bind-address": "*", mode: "rule",
-    profile: { "store-selected": true, "store-fake-ip": true },
-    "unified-delay": true, "tcp-concurrent": true, "keep-alive-interval": 1800,
-    "find-process-mode": "strict", "geodata-mode": true, "geodata-loader": "memconservative",
-    "geo-auto-update": true, "geo-update-interval": 24,
-    sniffer: {
-      enable: true, "force-dns-mapping": true, "parse-pure-ip": false, "override-destination": true,
-      sniff: { TLS: { ports: [443, 8443] }, HTTP: { ports: [80, "8080-8880"] }, QUIC: { ports: [443, 8443] } },
-      "skip-src-address": ["127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
-      "force-domain": ["+.google.com", "+.googleapis.com", "+.googleusercontent.com", "+.youtube.com", "+.facebook.com", "+.messenger.com", "+.fbcdn.net", "fbcdn-a.akamaihd.net"],
-      "skip-domain": ["Mijia Cloud", "+.oray.com"]
-    },
-    ntp: { enable: true, "write-to-system": false, server: "cn.ntp.org.cn" },
-    "geox-url": {
-      geoip: URLS.geox.geoip,
-      geosite: URLS.geox.geosite,
-      mmdb: URLS.geox.mmdb,
-      asn: URLS.geox.asn
-    }
-  },
-  common: {
-    ruleProvider: { type: "http", format: "yaml", interval: 86400 },
-    proxyGroup: { interval: 300, timeout: 3000, url: "http://cp.cloudflare.com/generate_204", lazy: true, "max-failed-times": 3, hidden: false },
-    defaultProxyGroups: [
-      { name: "下载软件", icon: ICONS.Download, proxies: ["直连", "REJECT", "默认节点", "国内网站"] },
-      { name: "其他外网", icon: ICONS.StreamingNotCN, proxies: ["默认节点", "国内网站"] },
-      { name: "国内网站", url: "http://wifi.vivo.com.cn/generate_204", icon: ICONS.StreamingCN, proxies: ["直连", "默认节点"] }
-    ],
-    postRules: ["GEOSITE,private,DIRECT", "GEOIP,private,DIRECT,no-resolve", "GEOSITE,cn,国内网站", "GEOIP,cn,国内网站,no-resolve", "MATCH,其他外网"]
-  }
-};
 
 /* ===================== AI 数据存取 ===================== */
 CentralManager.prototype.loadAIDBFromFile = function () {
