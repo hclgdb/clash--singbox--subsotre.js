@@ -1,117 +1,17 @@
 "use strict";
 
 /**
- * Central Orchestrator - 精简增强版（功能等效/性能不降）
- * - 保留原有 API 与行为：main, CentralManager, NodeManager, Config
- * - 统一数值与工具函数，减少重复与分支
- * - 事件驱动、指标融合、镜像检测、隐私模式与区域自动分组保持不变
+ * Central Orchestrator - 精简增强版（功能等效 / 性能不降 / 结构更稳 / 代码更少）
+ * 保留原有 API：main, CentralManager, NodeManager, Config
  */
 
-/* ===================== 平台检测与工具 ===================== */
+/* ===================== 平台与工具 ===================== */
 const PLATFORM = (() => {
   const isNode = typeof process !== "undefined" && !!process.versions?.node;
   const isBrowser = typeof window !== "undefined" && typeof window.addEventListener === "function";
   return Object.freeze({ isNode, isBrowser });
 })();
 
-const Utils = {
-  now: () => Date.now(),
-  clamp: (v, min, max) => Math.max(min, Math.min(max, v)),
-  clamp01: (v) => Math.max(0, Math.min(1, v)),
-  isFunc: (f) => typeof f === "function",
-  sleep(ms = 0) { return new Promise(r => setTimeout(r, Math.max(0, ms | 0))); },
-  async retry(fn, attempts, delay) {
-    const maxA = Math.max(1, Math.min(10, Math.floor(attempts) || CONSTANTS.MAX_RETRY_ATTEMPTS));
-    const baseD = Math.max(0, Math.min(CONSTANTS.MAX_RETRY_BACKOFF_MS, Math.floor(delay) || CONSTANTS.RETRY_DELAY_BASE));
-    let lastErr;
-    for (let i = 0; i < maxA; i++) {
-      try { return await fn(); } catch (e) { lastErr = e; if (i < maxA - 1) await Utils.sleep(Math.min(CONSTANTS.MAX_RETRY_BACKOFF_MS, baseD * (2 ** i))); }
-    }
-    throw lastErr || new Error("retry: 所有重试都失败");
-  },
-  async asyncPool(tasks, limit = CONSTANTS.CONCURRENCY_LIMIT) {
-    if (!Array.isArray(tasks) || tasks.length === 0) return [];
-    const n = Math.max(1, Math.min(50, Math.floor(limit) || CONSTANTS.CONCURRENCY_LIMIT || 3));
-    const res = new Array(tasks.length); let idx = 0;
-    async function runner() {
-      while (idx < tasks.length) {
-        const cur = idx++, t = tasks[cur];
-        if (!Utils.isFunc(t)) { res[cur] = { __error: new Error(`任务 ${cur} 不是函数`) }; continue; }
-        try {
-          const v = t(); res[cur] = (v && typeof v.then === "function") ? await v : v;
-        } catch (e) { res[cur] = { __error: e || new Error("任务执行失败") }; }
-      }
-    }
-    await Promise.all(Array(Math.min(n, tasks.length)).fill(0).map(runner));
-    return res;
-  },
-  calculateWeightedAverage(values, weightFactor = 0.9) {
-    if (!Array.isArray(values) || values.length === 0) return 0;
-    let sum = 0, wsum = 0, n = values.length;
-    for (let i = 0; i < n; i++) { const w = Math.pow(weightFactor, n - i - 1); sum += values[i] * w; wsum += w; }
-    return wsum ? sum / wsum : 0;
-  },
-  calculateStdDev(values) {
-    if (!Array.isArray(values) || values.length === 0) return 0;
-    const avg = values.reduce((a, b) => a + b, 0) / values.length;
-    const varSum = values.reduce((a, b) => a + Math.pow(b - avg, 2), 0);
-    return Math.sqrt(varSum / values.length);
-  },
-  calculateTrend(values) {
-    const n = Array.isArray(values) ? values.length : 0; if (n < 2) return 0;
-    let sx = 0, sy = 0, sxy = 0, sx2 = 0, sw = 0;
-    for (let i = 0; i < n; i++) { const w = (i + 1) / n, x = i, y = values[i]; sw += w; sx += x * w; sy += y * w; sxy += x * y * w; sx2 += x * x * w; }
-    const den = sw * sx2 - sx * sx; return den === 0 ? 0 : (sw * sxy - sx * sy) / den;
-  },
-  calculatePercentile(values, p) {
-    if (!Array.isArray(values) || values.length === 0) return 0;
-    const sorted = [...values].sort((a, b) => a - b), index = (p / 100) * (sorted.length - 1), i = Math.floor(index), f = index - i;
-    return (i === index) ? sorted[index] : sorted[i] + (sorted[i + 1] - sorted[i]) * f;
-  },
-  isValidDomain(d) { return typeof d === "string" && /^[a-zA-Z0-9.-]+$/.test(d) && !d.startsWith(".") && !d.endsWith(".") && !d.includes(".."); },
-  isIPv4(ip) { return typeof ip === "string" && /^(\d{1,3}\.){3}\d{1,3}$/.test(ip); },
-  isPrivateIP(ip) {
-    if (!Utils.isIPv4(ip)) return false;
-    try { const [a, b] = ip.split(".").map(n => parseInt(n, 10)); return a === 10 || a === 127 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31); }
-    catch { return false; }
-  },
-  filterProxiesByRegion(proxies, region) {
-    if (!Array.isArray(proxies) || !region?.regex) return [];
-    return proxies.filter(p => {
-      if (!p || typeof p.name !== "string") return false;
-      const m = p.name.match(/(?:[xX✕✖⨉]|倍率)(\d+\.?\d*)/i);
-      const mult = m ? parseFloat(m[1]) : 1;
-      return region.regex.test(p.name) && mult <= Config.regionOptions.ratioLimit;
-    }).map(p => p.name);
-  },
-  createServiceGroups(config, regionGroupNames, ruleProviders, rules) {
-    if (!config || !Array.isArray(regionGroupNames) || !(ruleProviders instanceof Map) || !Array.isArray(rules)) return;
-    Config.services.forEach(service => {
-      if (!Config.ruleOptions[service.id]) return;
-      if (Array.isArray(service.rule)) rules.push(...service.rule);
-      if (service.ruleProvider) {
-        ruleProviders.set(service.ruleProvider.name, {
-          ...Config.common.ruleProvider,
-          behavior: service.ruleProvider.behavior || "classical",
-          format: service.ruleProvider.format || "text",
-          url: service.ruleProvider.url,
-          path: `./ruleset/${service.ruleProvider.name.split('-')[0]}/${service.ruleProvider.name}.${service.ruleProvider.format || 'list'}`
-        });
-      }
-      const proxies = service.proxies || ["默认节点", ...(service.proxiesOrder || []), ...regionGroupNames, "直连"];
-      config["proxy-groups"].push({
-        ...Config.common.proxyGroup,
-        name: service.name,
-        type: "select",
-        proxies,
-        url: service.url || Config.common.proxyGroup.url,
-        icon: service.icon
-      });
-    });
-  }
-};
-
-/* ===================== 常量定义 ===================== */
 const CONSTANTS = Object.freeze({
   PREHEAT_NODE_COUNT: 10,
   NODE_TEST_TIMEOUT: 5000,
@@ -164,7 +64,99 @@ const CONSTANTS = Object.freeze({
   BIAS_JITTER_MAX_PENALTY: 10
 });
 
-/* ===================== 日志与错误 ===================== */
+const Utils = {
+  now: () => Date.now(),
+  clamp: (v, min, max) => Math.max(min, Math.min(max, v)),
+  clamp01: (v) => Math.max(0, Math.min(1, v)),
+  isFunc: (f) => typeof f === "function",
+  sleep(ms = 0) { return new Promise(r => setTimeout(r, Math.max(0, ms | 0))); },
+  async retry(fn, attempts = CONSTANTS.MAX_RETRY_ATTEMPTS, delay = CONSTANTS.RETRY_DELAY_BASE) {
+    const maxA = Math.max(1, Math.min(10, Math.floor(attempts)));
+    const baseD = Math.max(0, Math.min(CONSTANTS.MAX_RETRY_BACKOFF_MS, Math.floor(delay)));
+    let lastErr;
+    for (let i = 0; i < maxA; i++) {
+      try { return await fn(); } catch (e) {
+        lastErr = e;
+        if (i < maxA - 1) await Utils.sleep(Math.min(CONSTANTS.MAX_RETRY_BACKOFF_MS, baseD * (2 ** i)));
+      }
+    }
+    throw lastErr || new Error("retry: 所有重试都失败");
+  },
+  async asyncPool(tasks, limit = CONSTANTS.CONCURRENCY_LIMIT) {
+    if (!Array.isArray(tasks) || !tasks.length) return [];
+    const n = Math.max(1, Math.min(50, Math.floor(limit) || 3));
+    const res = new Array(tasks.length);
+    let idx = 0;
+    async function runner() {
+      while (idx < tasks.length) {
+        const cur = idx++, t = tasks[cur];
+        if (!Utils.isFunc(t)) { res[cur] = { __error: new Error(`任务 ${cur} 不是函数`) }; continue; }
+        try { const v = t(); res[cur] = (v && typeof v.then === "function") ? await v : v; }
+        catch (e) { res[cur] = { __error: e || new Error("任务执行失败") }; }
+      }
+    }
+    await Promise.all(Array(Math.min(n, tasks.length)).fill(0).map(runner));
+    return res;
+  },
+  calculateWeightedAverage(values, weightFactor = 0.9) {
+    if (!Array.isArray(values) || !values.length) return 0;
+    let sum = 0, wsum = 0, n = values.length;
+    for (let i = 0; i < n; i++) { const w = Math.pow(weightFactor, n - i - 1); sum += values[i] * w; wsum += w; }
+    return wsum ? sum / wsum : 0;
+  },
+  calculateStdDev(values) {
+    if (!Array.isArray(values) || !values.length) return 0;
+    const avg = values.reduce((a, b) => a + b, 0) / values.length;
+    return Math.sqrt(values.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / values.length);
+  },
+  calculateTrend(values) {
+    const n = Array.isArray(values) ? values.length : 0; if (n < 2) return 0;
+    let sx = 0, sy = 0, sxy = 0, sx2 = 0, sw = 0;
+    for (let i = 0; i < n; i++) { const w = (i + 1) / n, x = i, y = values[i]; sw += w; sx += x * w; sy += y * w; sxy += x * y * w; sx2 += x * x * w; }
+    const den = sw * sx2 - sx * sx; return den === 0 ? 0 : (sw * sxy - sx * sy) / den;
+  },
+  calculatePercentile(values, p) {
+    if (!Array.isArray(values) || !values.length) return 0;
+    const s = [...values].sort((a, b) => a - b), index = (p / 100) * (s.length - 1), i = Math.floor(index), f = index - i;
+    return (i === index) ? s[index] : s[i] + (s[i + 1] - s[i]) * f;
+  },
+  isValidDomain(d) { return typeof d === "string" && /^[a-zA-Z0-9.-]+$/.test(d) && !d.startsWith(".") && !d.endsWith(".") && !d.includes(".."); },
+  isIPv4(ip) { return typeof ip === "string" && /^(\d{1,3}\.){3}\d{1,3}$/.test(ip); },
+  isPrivateIP(ip) {
+    if (!Utils.isIPv4(ip)) return false;
+    try { const [a, b] = ip.split(".").map(n => parseInt(n, 10)); return a === 10 || a === 127 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31); }
+    catch { return false; }
+  },
+  filterProxiesByRegion(proxies, region) {
+    if (!Array.isArray(proxies) || !region?.regex) return [];
+    return proxies.filter(p => {
+      if (!p || typeof p.name !== "string") return false;
+      const m = p.name.match(/(?:[xX✕✖⨉]|倍率)(\d+\.?\d*)/i);
+      const mult = m ? parseFloat(m[1]) : 1;
+      return region.regex.test(p.name) && mult <= Config.regionOptions.ratioLimit;
+    }).map(p => p.name);
+  },
+  createServiceGroups(config, regionGroupNames, ruleProviders, rules) {
+    if (!config || !Array.isArray(regionGroupNames) || !(ruleProviders instanceof Map) || !Array.isArray(rules)) return;
+    Config.services.forEach(service => {
+      if (!Config.ruleOptions[service.id]) return;
+      if (Array.isArray(service.rule)) rules.push(...service.rule);
+      if (service.ruleProvider) {
+        const rp = service.ruleProvider;
+        ruleProviders.set(rp.name, {
+          ...Config.common.ruleProvider,
+          behavior: rp.behavior || "classical",
+          format: rp.format || "text",
+          url: rp.url,
+          path: `./ruleset/${rp.name.split('-')[0]}/${rp.name}.${rp.format || 'list'}`
+        });
+      }
+      const proxies = service.proxies || ["默认节点", ...(service.proxiesOrder || []), ...regionGroupNames, "直连"];
+      config["proxy-groups"].push({ ...Config.common.proxyGroup, name: service.name, type: "select", proxies, url: service.url || Config.common.proxyGroup.url, icon: service.icon });
+    });
+  }
+};
+
 class Logger {
   static error(...a) { console.error("[ERROR]", ...a); }
   static info(...a)  { console.info("[INFO]", ...a); }
@@ -179,26 +171,26 @@ class EventEmitter {
   constructor() { this.eventListeners = new Map(); }
   on(ev, fn) { if (!ev || !Utils.isFunc(fn)) return; const arr = this.eventListeners.get(ev) || []; arr.push(fn); this.eventListeners.set(ev, arr); }
   off(ev, fn) { const arr = this.eventListeners.get(ev); if (!arr) return; const i = arr.indexOf(fn); if (i !== -1) arr.splice(i, 1); if (!arr.length) this.eventListeners.delete(ev); }
-  emit(ev, ...args) { const arr = this.eventListeners.get(ev); if (!arr || !arr.length) return; for (const fn of [...arr]) { try { fn(...args); } catch (e) { Logger.error(`事件 ${ev} 处理失败:`, e.stack || e); } } }
+  emit(ev, ...args) {
+    const arr = this.eventListeners.get(ev); if (!arr?.length) return;
+    for (const fn of (arr.length > 1 ? [...arr] : arr)) { try { fn(...args); } catch (e) { Logger.error(`事件 ${ev} 处理失败:`, e.stack || e); } }
+  }
   removeAllListeners(ev) { if (ev) this.eventListeners.delete(ev); else this.eventListeners.clear(); }
 }
 
-/* ===================== 应用状态 ===================== */
+/* ===================== 状态与缓存 ===================== */
 class AppState {
   constructor() { this.nodes = new Map(); this.metrics = new Map(); this.config = {}; this.lastUpdated = Utils.now(); }
   updateNodeStatus(nodeId, status) {
     if (!nodeId || typeof nodeId !== "string") return;
-    const prev = this.nodes.get(nodeId) || {};
-    this.nodes.set(nodeId, { ...prev, ...status });
+    this.nodes.set(nodeId, { ...(this.nodes.get(nodeId) || {}), ...status });
     this.lastUpdated = Utils.now();
   }
 }
 
-/* ===================== LRU 缓存 ===================== */
 class LRUCache {
   constructor({ maxSize = CONSTANTS.LRU_CACHE_MAX_SIZE, ttl = CONSTANTS.LRU_CACHE_TTL } = {}) {
-    this.cache = new Map();
-    this.maxSize = Math.max(1, Number(maxSize) || CONSTANTS.LRU_CACHE_MAX_SIZE);
+    this.cache = new Map(); this.maxSize = Math.max(1, Number(maxSize) || CONSTANTS.LRU_CACHE_MAX_SIZE);
     this.ttl = Math.max(1, Number(ttl) || CONSTANTS.LRU_CACHE_TTL);
     this.head = { key: null }; this.tail = { key: null, prev: this.head }; this.head.next = this.tail;
   }
@@ -213,9 +205,7 @@ class LRUCache {
   set(key, value, ttl = this.ttl) {
     if (key == null) return;
     if (this.cache.size / this.maxSize > CONSTANTS.CACHE_CLEANUP_THRESHOLD) this._cleanupExpiredEntries(CONSTANTS.CACHE_CLEANUP_BATCH_SIZE);
-    if (this.cache.has(key)) {
-      const e = this.cache.get(key); e.value = value; e.ttl = Math.max(1, ttl | 0); e.timestamp = Utils.now(); this._unlink(e); this._pushFront(e); return;
-    }
+    if (this.cache.has(key)) { const e = this.cache.get(key); e.value = value; e.ttl = Math.max(1, ttl | 0); e.timestamp = Utils.now(); this._unlink(e); this._pushFront(e); return; }
     if (this.cache.size >= this.maxSize) this._evictTail();
     const e = { key, value, ttl: Math.max(1, ttl | 0), timestamp: Utils.now(), prev: null, next: null };
     this._pushFront(e); this.cache.set(key, e);
@@ -258,34 +248,35 @@ let __ghSelectLock = Promise.resolve();
 const GH_RAW_URL = (path) => `${GH_PROXY_PREFIX}https://raw.githubusercontent.com/${path}`;
 const GH_RELEASE_URL = (path) => `${GH_PROXY_PREFIX}https://github.com/${path}`;
 const pickTestTarget = () => GH_TEST_TARGETS[Math.floor(Math.random() * GH_TEST_TARGETS.length)];
-const makeTimedFetcher = (runtimeFetch, timeoutMs) => async (url, opts, to = timeoutMs) => {
-  if (to > 0 && typeof AbortController !== "undefined") {
-    const c = new AbortController(), tid = setTimeout(() => c.abort(), to);
-    try { const r = await runtimeFetch(url, { ...(opts || {}), signal: c.signal }); clearTimeout(tid); return r; }
-    catch (e) { clearTimeout(tid); throw e; }
-  }
-  return runtimeFetch(url, opts || {});
-};
-async function __probeMirror(prefix, fetchFn) {
+
+async function __probeMirror(prefix, fetchFn, timeoutMs) {
   const testUrl = prefix ? (prefix + pickTestTarget()) : pickTestTarget();
   try {
-    const resp = await fetchFn(testUrl, { method: "GET", headers: { "User-Agent": CONSTANTS.DEFAULT_USER_AGENT } }, CONSTANTS.GEO_INFO_TIMEOUT);
+    const c = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const tid = timeoutMs > 0 ? setTimeout(() => { try { c?.abort(); } catch {} }, timeoutMs) : null;
+    const resp = await fetchFn(testUrl, { method: "GET", headers: { "User-Agent": CONSTANTS.DEFAULT_USER_AGENT }, signal: c?.signal });
+    if (tid) clearTimeout(tid);
     return !!resp && resp.ok;
   } catch { return false; }
 }
 async function selectBestMirror(runtimeFetch) {
-  const now = Utils.now(); if (__ghSelected && (now - __ghLastProbeTs) < __GH_PROBE_TTL) return __ghSelected;
+  const now = Utils.now();
+  if (__ghSelected && (now - __ghLastProbeTs) < __GH_PROBE_TTL) return __ghSelected;
+
   __ghSelectLock = __ghSelectLock.then(async () => {
-    const tf = makeTimedFetcher(runtimeFetch, CONSTANTS.GEO_INFO_TIMEOUT);
-    const results = await Promise.all(GH_MIRRORS.map(m => __probeMirror(m, tf).then(ok => ({ m, ok })).catch(() => ({ m, ok: false })) ));
+    const results = await Promise.all(GH_MIRRORS.map(m =>
+      __probeMirror(m, runtimeFetch, CONSTANTS.GEO_INFO_TIMEOUT).then(ok => ({ m, ok })).catch(() => ({ m, ok: false }))
+    ));
     const healthy = results.filter(r => r.ok).map(r => r.m);
     const chosen = healthy.includes("") ? "" : (healthy[0] || __ghSelected || "");
-    __ghSelected = chosen; __ghLastProbeTs = now; GH_PROXY_PREFIX = chosen; return chosen;
+    __ghSelected = chosen; __ghLastProbeTs = now; GH_PROXY_PREFIX = chosen;
+    return chosen;
   }).catch(e => { Logger.warn("selectBestMirror 失败，保持现有前缀:", e?.message || e); return __ghSelected || ""; });
+
   return __ghSelectLock;
 }
 
-/* ===================== 资源URL和图标 ===================== */
+/* ===================== 资源与图标 ===================== */
 const ICONS = {
   Proxy: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/Proxy.png"),
   WorldMap: () => GH_RAW_URL("Koolson/Qure/master/IconSet/Color/World_Map.png"),
@@ -446,8 +437,7 @@ class NodeManager extends EventEmitter {
   isInCooldown(id) { const end = this.switchCooldown.get(id); return !!(end && Utils.now() < end); }
   _cooldownTime(id) {
     const s = Utils.clamp(this.nodeQuality.get(id) || 0, 0, 100);
-    const f = 1 + (s / 100) * 0.9;
-    return Utils.clamp(CONSTANTS.BASE_SWITCH_COOLDOWN * f, CONSTANTS.MIN_SWITCH_COOLDOWN, CONSTANTS.MAX_SWITCH_COOLDOWN);
+    return Utils.clamp(CONSTANTS.BASE_SWITCH_COOLDOWN * (1 + (s / 100) * 0.9), CONSTANTS.MIN_SWITCH_COOLDOWN, CONSTANTS.MAX_SWITCH_COOLDOWN);
   }
   _recordSwitchEvent(oldId, newId, targetGeo) {
     Logger.debug("SwitchEvent", { timestamp: Utils.now(), oldNodeId: oldId, newNodeId: newId, targetGeo: targetGeo ? { country: targetGeo.country, region: targetGeo.regionName || targetGeo.region } : null, reason: oldId ? "质量过低" : "初始选择" });
@@ -459,20 +449,18 @@ class NodeManager extends EventEmitter {
     this.nodeHistory.set(id, h.length > CONSTANTS.MAX_HISTORY_RECORDS ? h.slice(-CONSTANTS.MAX_HISTORY_RECORDS) : h);
   }
   updateNodeQuality(id, delta) {
-    const d = Number(delta) || 0;
-    const cur = this.nodeQuality.get(id) || 0;
-    const ns = Utils.clamp(cur + Utils.clamp(d, -20, 20), 0, 100);
+    const ns = Utils.clamp((this.nodeQuality.get(id) || 0) + Utils.clamp(Number(delta) || 0, -20, 20), 0, 100);
     this.nodeQuality.set(id, ns); this._updateNodeHistory(id, ns);
   }
   async switchToNode(id, targetGeo) {
     if (!id || typeof id !== "string") { Logger.warn("switchToNode: 无效的节点ID"); return null; }
     if (this.currentNode === id) return { id };
-    const central = CentralManager.getInstance?.(); const node = central?.state?.config?.proxies?.find(n => n && n.id === id);
+    const central = CentralManager.getInstance?.(); const node = central?.state?.config?.proxies?.find(n => n?.id === id);
     if (!node) { Logger.warn(`尝试切换到不存在的节点: ${id}`); return null; }
     const oldId = this.currentNode; this.currentNode = id;
     this.switchCooldown.set(id, Utils.now() + this._cooldownTime(id));
     this._recordSwitchEvent(oldId, id, targetGeo);
-    const st = central.state.nodes?.get(id); const region = st?.geoInfo?.regionName || "未知区域";
+    const st = central.state.nodes?.get(id); const region = st?.geoInfo?.region || st?.geoInfo?.regionName || "未知区域";
     Logger.info(`节点已切换: ${oldId || "无"} -> ${id} (区域: ${region})`);
     return node;
   }
@@ -481,33 +469,27 @@ class NodeManager extends EventEmitter {
     const scoreFor = (node) => {
       if (!node?.id) return 0;
       const quality = this.nodeQuality.get(node.id) || 0;
-      const nodeState = central?.state?.nodes?.get(node.id) || {};
-      const m = nodeState.metrics || {};
-      const avail = Number(nodeState.availabilityRate) || 0;
-      const availPenalty = avail < CONSTANTS.AVAILABILITY_MIN_RATE ? CONSTANTS.BIAS_AVAIL_PENALTY_BAD : 0;
+      const st = central?.state?.nodes?.get(node.id) || {};
+      const m = st.metrics || {};
+      const avail = Number(st.availabilityRate) || 0;
       const { metricScore } = CentralManager.scoreComponents(m);
-      const tracker = this.nodeSuccess.get(node.id);
-      const successRate = tracker ? Utils.clamp(tracker.rate * 100, 0, 100) : 0;
-      const qw = CONSTANTS.QUALITY_WEIGHT, mw = CONSTANTS.METRIC_WEIGHT, sw = CONSTANTS.SUCCESS_WEIGHT; const tw = qw + mw + sw || 1;
-      const composite = (quality * (qw / tw)) + (metricScore * (mw / tw)) + (successRate * (sw / tw)) + availPenalty;
-      return Utils.clamp(composite, 0, 100);
+      const successRate = Utils.clamp((this.nodeSuccess.get(node.id)?.rate || 0) * 100, 0, 100);
+      const qw = CONSTANTS.QUALITY_WEIGHT, mw = CONSTANTS.METRIC_WEIGHT, sw = CONSTANTS.SUCCESS_WEIGHT, tw = qw + mw + sw || 1;
+      return Utils.clamp((quality * (qw / tw)) + (metricScore * (mw / tw)) + (successRate * (sw / tw)) + (avail < CONSTANTS.AVAILABILITY_MIN_RATE ? CONSTANTS.BIAS_AVAIL_PENALTY_BAD : 0), 0, 100);
     };
-    let best = nodes[0], bv = scoreFor(best);
-    for (let i = 1; i < nodes.length; i++) { const n = nodes[i]; if (!n) continue; const v = scoreFor(n); if (v > bv) { best = n; bv = v; } }
-    return best;
+    return nodes.reduce((best, n) => (scoreFor(n) > scoreFor(best) ? n : best), nodes[0]);
   }
   async getBestNode(nodes, targetGeo) {
-    if (!Array.isArray(nodes) || nodes.length === 0) { Logger.warn("getBestNode: 节点列表为空或无效"); return null; }
-    const pool = nodes.filter(n => n?.id && !this.isInCooldown(n.id));
-    const candidates = pool.length ? pool : nodes;
-    if (targetGeo?.regionName) {
-      const st = CentralManager.getInstance?.().state?.nodes;
-      if (st) {
-        const regional = candidates.filter(n => st.get(n.id)?.geoInfo?.regionName === targetGeo.regionName);
-        if (regional.length) return this._best(regional) || candidates[0];
-      }
+    if (!Array.isArray(nodes) || !nodes.length) { Logger.warn("getBestNode: 节点列表为空或无效"); return null; }
+    const candidates = nodes.filter(n => n?.id && !this.isInCooldown(n.id));
+    const pool = candidates.length ? candidates : nodes;
+    const st = CentralManager.getInstance?.().state?.nodes;
+    const regionName = targetGeo?.regionName || targetGeo?.region;
+    if (st && regionName) {
+      const regional = pool.filter(n => { const g = st.get(n.id)?.geoInfo; return g && (g.regionName === regionName || g.region === regionName); });
+      if (regional.length) return this._best(regional) || pool[0];
     }
-    return this._best(candidates) || candidates[0];
+    return this._best(pool) || pool[0];
   }
   async switchToBestNode(nodes, targetGeo) {
     if (!nodes?.length) return null;
@@ -515,7 +497,7 @@ class NodeManager extends EventEmitter {
     const oldId = this.currentNode; this.currentNode = best.id;
     this.switchCooldown.set(best.id, Utils.now() + this._cooldownTime(best.id));
     this._recordSwitchEvent(oldId, best.id, targetGeo);
-    const st = CentralManager.getInstance().state.nodes.get(best.id); const region = st?.geoInfo?.regionName || "未知区域";
+    const st = CentralManager.getInstance().state.nodes.get(best.id); const region = st?.geoInfo?.region || st?.geoInfo?.regionName || "未知区域";
     Logger.info(`节点已切换: ${oldId || "无"} -> ${best.id} (质量分: ${this.nodeQuality.get(best.id)}, 区域: ${region})`);
     return best;
   }
@@ -584,7 +566,7 @@ class CentralManager extends EventEmitter {
     this.throughputEstimator = new ThroughputEstimator(); this.regionAutoManager = new RegionAutoManager();
     this.eventListeners = null; this._listenersRegistered = false; CentralManager.instance = this;
 
-    Promise.resolve().then(() => this.initialize().catch(err => Logger.error("CentralManager 初始化失败:", err?.stack || err))).catch(err => Logger.error("CentralManager 初始化调度失败:", err?.stack || err));
+    Promise.resolve().then(() => this.initialize().catch(err => Logger.error("CentralManager 初始化失败:", err?.stack || err)));
   }
 
   static scoreComponents(m = {}) {
@@ -596,8 +578,7 @@ class CentralManager extends EventEmitter {
     const jitterScore  = Utils.clamp(25 - jitter, 0, 25);
     const lossScore    = Utils.clamp(25 * (1 - loss), 0, 25);
     const throughputScore = Utils.clamp(Math.round(Math.log10(1 + bps) * 2), 0, CONSTANTS.THROUGHPUT_SCORE_MAX);
-    const total = Utils.clamp(Math.round(latencyScore + jitterScore + lossScore + throughputScore), 0, 100);
-    return { latencyScore, jitterScore, lossScore, throughputScore, metricScore: total };
+    return { latencyScore, jitterScore, lossScore, throughputScore, metricScore: Utils.clamp(Math.round(latencyScore + jitterScore + lossScore + throughputScore), 0, 100) };
   }
 
   async _getFetchRuntime() {
@@ -613,9 +594,7 @@ class CentralManager extends EventEmitter {
 
   async _safeFetch(url, options = {}, timeout = CONSTANTS.GEO_INFO_TIMEOUT) {
     if (!url || typeof url !== "string") throw new Error("_safeFetch: 无效的URL参数");
-    if (timeout && (typeof timeout !== "number" || timeout <= 0)) timeout = CONSTANTS.GEO_INFO_TIMEOUT;
-    const { _fetch, _AbortController } = await this._getFetchRuntime();
-    if (!_fetch) throw new Error("fetch 不可用于当前运行环境，且未找到可回退的实现");
+    const { _fetch, _AbortController } = await this._getFetchRuntime(); if (!_fetch) throw new Error("fetch 不可用于当前运行环境，且未找到可回退的实现");
 
     if (url.startsWith("https://raw.githubusercontent.com/") || url.startsWith("https://github.com/")) {
       try { const best = await selectBestMirror(_fetch); GH_PROXY_PREFIX = best || ""; url = `${GH_PROXY_PREFIX}${url}`; }
@@ -626,7 +605,7 @@ class CentralManager extends EventEmitter {
     if (_AbortController && timeout > 0) {
       const c = new _AbortController(), tid = setTimeout(() => { try { c.abort(); } catch {} }, timeout);
       try { const resp = await _fetch(url, { ...opts, signal: c.signal }); clearTimeout(tid); return resp; }
-      catch (err) { clearTimeout(tid); if (err.name === "AbortError" || err.name === "TimeoutError") throw new Error(`请求超时 (${timeout}ms): ${url}`); throw err; }
+      catch (err) { clearTimeout(tid); if (["AbortError", "TimeoutError"].includes(err?.name)) throw new Error(`请求超时 (${timeout}ms): ${url}`); throw err; }
     }
     if (timeout > 0) return Promise.race([_fetch(url, opts), new Promise((_, rej) => setTimeout(() => rej(new Error(`请求超时 (${timeout}ms): ${url}`)), timeout)) ]);
     return _fetch(url, opts);
@@ -635,7 +614,6 @@ class CentralManager extends EventEmitter {
   async initialize() {
     try { const { _fetch } = await this._getFetchRuntime(); if (_fetch) await selectBestMirror(_fetch); } catch (e) { Logger.warn("初始化阶段 GH 镜像预选失败:", e?.message || e); }
     await this.loadAIDBFromFile().catch(err => Logger.warn("加载AI数据失败，使用默认值:", err?.message || err));
-
     if (!this._listenersRegistered) { try { this.setupEventListeners(); this._listenersRegistered = true; } catch (e) { Logger.warn("设置事件监听器失败:", e?.message || e); } }
     this.on("requestDetected", (ip) => this.handleRequestWithGeoRouting(ip).catch(err => Logger.warn("地理路由处理失败:", err?.message || err)));
     this.preheatNodes().catch(err => Logger.warn("节点预热失败:", err?.message || err));
@@ -656,8 +634,7 @@ class CentralManager extends EventEmitter {
     Logger.info("开始清理资源...");
     try { this.cleanupEventListeners(); this._listenersRegistered = false; } catch (e) { Logger.warn("清理事件监听器失败:", e?.message || e); }
     try { await this.saveAIDBToFile(); } catch (e) { Logger.warn("保存AI数据失败:", e?.message || e); }
-    try { this.lruCache?.clear(); } catch (e) { Logger.warn("清理LRU缓存失败:", e?.message || e); }
-    try { this.geoInfoCache?.clear(); } catch (e) { Logger.warn("清理地理信息缓存失败:", e?.message || e); }
+    try { this.lruCache?.clear(); this.geoInfoCache?.clear(); } catch (e) { Logger.warn("清理缓存失败:", e?.message || e); }
     Logger.info("资源清理完成");
   }
 
@@ -668,16 +645,16 @@ class CentralManager extends EventEmitter {
       performanceThresholdBreached: async (nodeId) => this.onPerformanceThresholdBreached(nodeId),
       evaluationCompleted: () => this.onEvaluationCompleted()
     };
-    if (typeof Config !== "undefined" && Config.on) Config.on("configChanged", this.eventListeners.configChanged);
-    if (PLATFORM.isBrowser) window.addEventListener("online", this.eventListeners.networkOnline);
-    if (this.nodeManager?.on) this.nodeManager.on("performanceThresholdBreached", this.eventListeners.performanceThresholdBreached);
+    try { if (typeof Config !== "undefined" && Config.on) Config.on("configChanged", this.eventListeners.configChanged); } catch {}
+    try { if (PLATFORM.isBrowser) window.addEventListener("online", this.eventListeners.networkOnline); } catch {}
+    try { if (this.nodeManager?.on) this.nodeManager.on("performanceThresholdBreached", this.eventListeners.performanceThresholdBreached); } catch {}
     this.on("evaluationCompleted", this.eventListeners.evaluationCompleted);
   }
   cleanupEventListeners() {
     if (!this.eventListeners) return;
-    if (typeof Config !== "undefined" && Config.off) { try { Config.off("configChanged", this.eventListeners.configChanged); } catch {} }
-    if (PLATFORM.isBrowser && window.removeEventListener) { try { window.removeEventListener("online", this.eventListeners.networkOnline); } catch {} }
-    if (this.nodeManager?.off) { try { this.nodeManager.off("performanceThresholdBreached", this.eventListeners.performanceThresholdBreached); } catch {} }
+    try { if (typeof Config !== "undefined" && Config.off) Config.off("configChanged", this.eventListeners.configChanged); } catch {}
+    try { if (PLATFORM.isBrowser && window.removeEventListener) window.removeEventListener("online", this.eventListeners.networkOnline); } catch {}
+    try { if (this.nodeManager?.off) this.nodeManager.off("performanceThresholdBreached", this.eventListeners.performanceThresholdBreached); } catch {}
     try { this.off("evaluationCompleted", this.eventListeners.evaluationCompleted); } catch {}
     this.eventListeners = null;
   }
@@ -687,7 +664,7 @@ class CentralManager extends EventEmitter {
   async onNetworkOnline() { Logger.info("网络恢复，触发节点评估..."); await this.evaluateAllNodes(); }
   async onPerformanceThresholdBreached(nodeId) {
     Logger.info(`节点 ${nodeId} 性能阈值突破，触发单节点评估...`);
-    const node = this.state.config.proxies?.find(n => n && n.id === nodeId);
+    const node = this.state.config.proxies?.find(n => n?.id === nodeId);
     if (node) await this.evaluateNodeQuality(node); else Logger.warn(`节点 ${nodeId} 不存在，无法评估`);
   }
   onEvaluationCompleted() { Logger.info("节点评估完成，触发数据保存和节点清理..."); this.saveAIDBToFile(); this.autoEliminateNodes(); }
@@ -699,7 +676,7 @@ class CentralManager extends EventEmitter {
     const results = await Utils.asyncPool(tasks, CONSTANTS.CONCURRENCY_LIMIT);
     results.forEach((res, i) => {
       const node = testNodes[i];
-      if (res && res.__error) { Logger.error(`节点预热失败: ${node.id}`, res.__error?.message || res.__error); return; }
+      if (res?.__error) { Logger.error(`节点预热失败: ${node.id}`, res.__error?.message || res.__error); return; }
       const bps = this.throughputEstimator.bpsFromBytesLatency(res); const enriched = { ...res, bps };
       this.state.updateNodeStatus(node.id, { initialMetrics: enriched, lastTested: Utils.now() });
       this.metricsManager.append(node.id, enriched);
@@ -708,7 +685,7 @@ class CentralManager extends EventEmitter {
     });
   }
 
-  calculateQuality(metrics) { const { metricScore } = CentralManager.scoreComponents(metrics || {}); return metricScore; }
+  calculateQuality(metrics) { return CentralManager.scoreComponents(metrics || {}).metricScore; }
 
   async evaluateAllNodes() {
     const proxies = this.state.config.proxies || []; if (!proxies.length) return;
@@ -728,9 +705,8 @@ class CentralManager extends EventEmitter {
     this.availabilityTracker.ensure(node.id);
     const isSim = metrics?.__simulated === true;
     const latency = Math.max(0, Number(metrics?.latency) || 0);
-    const timeoutThreshold = (CONSTANTS.NODE_TEST_TIMEOUT || 5000) * 2;
     const hardFail = !!metrics.__hardFail;
-    const success = !!(metrics && !hardFail && latency > 0 && latency < timeoutThreshold && !isSim);
+    const success = !!(metrics && !hardFail && latency > 0 && latency < (CONSTANTS.NODE_TEST_TIMEOUT * 2) && !isSim);
     this.availabilityTracker.record(node.id, success, { hardFail });
 
     let score = 0; try { score = Utils.clamp(this.calculateQuality(metrics), 0, 100); } catch (e) { Logger.error(`计算节点质量分失败 (${node.id}):`, e.message); }
@@ -771,8 +747,7 @@ class CentralManager extends EventEmitter {
     proxies.forEach(node => {
       const st = this.state.nodes.get(node.id); const samples = (this.state.metrics.get(node.id) || []).length;
       if (samples < CONSTANTS.MIN_SAMPLE_SIZE) return;
-      const outdated = !st || st.lastEvaluated < threshold; const lowScore = st?.score < CONSTANTS.NODE_CLEANUP_THRESHOLD;
-      if (outdated || lowScore) {
+      if ((!st || st.lastEvaluated < threshold) || (st?.score < CONSTANTS.NODE_CLEANUP_THRESHOLD)) {
         this.state.nodes.delete(node.id); this.state.metrics.delete(node.id); this.nodeManager.nodeQuality.delete(node.id);
         Logger.info(`已清理异常节点: ${node.id}`);
       }
@@ -785,12 +760,25 @@ class CentralManager extends EventEmitter {
 
     const urlStr = typeof reqCtx.url === "string" ? reqCtx.url : (reqCtx.url?.toString?.() || "");
     let hostname = reqCtx.host, port = reqCtx.port, protocol = reqCtx.protocol;
-    try { if (urlStr) { const u = new URL(urlStr); hostname = hostname || u.hostname; protocol = protocol || (u.protocol || "").replace(":", "").toLowerCase(); port = port || (u.port ? Number(u.port) : (protocol === "https" ? 443 : protocol === "http" ? 80 : undefined)); } } catch {}
+    try {
+      if (urlStr) {
+        const u = new URL(urlStr);
+        hostname = hostname || u.hostname;
+        protocol = protocol || (u.protocol || "").replace(":", "").toLowerCase();
+        port = port || (u.port ? Number(u.port) : (protocol === "https" ? 443 : protocol === "http" ? 80 : undefined));
+      }
+    } catch {}
 
     const clientIP = reqCtx.clientIP || reqCtx.headers?.["X-Forwarded-For"] || reqCtx.headers?.["Remote-Address"];
     const clientGeo = clientIP ? (this.isGeoExternalLookupEnabled() ? await this.getGeoInfo(clientIP) : this._getFallbackGeoInfo(hostname)) : null;
 
-    let targetGeo = null; try { if (hostname && Utils.isValidDomain(hostname)) { const targetIP = await this.resolveDomainToIP(hostname); if (targetIP) targetGeo = this.isGeoExternalLookupEnabled() ? await this.getGeoInfo(targetIP) : this._getFallbackGeoInfo(hostname); } } catch {}
+    let targetGeo = null;
+    try {
+      if (hostname && Utils.isValidDomain(hostname)) {
+        const targetIP = await this.resolveDomainToIP(hostname);
+        if (targetIP) targetGeo = this.isGeoExternalLookupEnabled() ? await this.getGeoInfo(targetIP) : this._getFallbackGeoInfo(hostname);
+      }
+    } catch {}
 
     const isVideo = !!(reqCtx.headers?.["Content-Type"]?.includes("video") || CONSTANTS.STREAM_HINT_REGEX.test(urlStr));
     const isAI = CONSTANTS.AI_HINT_REGEX.test(urlStr || hostname || "");
@@ -811,25 +799,22 @@ class CentralManager extends EventEmitter {
       + (preferLowLatency ? Utils.clamp(CONSTANTS.BIAS_LATENCY_MAX_BONUS - (c.latency / 30), 0, CONSTANTS.BIAS_LATENCY_MAX_BONUS) : 0)
       - (preferStability ? Math.min(CONSTANTS.BIAS_JITTER_MAX_PENALTY, Math.round(c.jitter / 50)) : 0);
 
-    let regionPreferred = null;
-    if (targetGeo?.country && Array.isArray(Config.regionOptions?.regions)) {
-      const targetRegion = Config.regionOptions.regions.find(r => r && ((r.name && r.name.includes(targetGeo.country)) || (r.regex && r.regex.test(targetGeo.country))));
-      if (targetRegion) regionPreferred = Utils.filterProxiesByRegion(nodes, targetRegion);
-    }
-
     let candidates = enriched;
+    const regionPreferred = (targetGeo?.country && Array.isArray(Config.regionOptions?.regions))
+      ? Utils.filterProxiesByRegion(nodes, Config.regionOptions.regions.find(r => r && ((r.name?.includes(targetGeo.country)) || (r.regex?.test(targetGeo.country)))))
+      : null;
+
     if (regionPreferred?.length) {
       const set = new Set(regionPreferred);
       const regionCandidates = candidates.filter(c => set.has(c.node.name));
       if (regionCandidates.length) candidates = regionCandidates;
     }
-    const ordered = candidates.sort((a, b) => bias(b) - bias(a)).map(c => c.node);
+
+    const ordered = (candidates.length ? candidates : enriched).sort((a, b) => bias(b) - bias(a)).map(c => c.node);
     const bestNode = await this.nodeManager.getBestNode(ordered.length ? ordered : nodes, targetGeo);
     const selected = bestNode || nodes[0];
 
-    const userStr = typeof reqCtx.user === "string" ? reqCtx.user : "default";
-    const country = clientGeo?.country || "unknown";
-    const cacheKey = `${userStr}:${country}:${hostname || "unknown"}`;
+    const cacheKey = `${typeof reqCtx.user === "string" ? reqCtx.user : "default"}:${clientGeo?.country || "unknown"}:${hostname || "unknown"}`;
     try { if (selected?.id) this.lruCache.set(cacheKey, selected.id); } catch {}
 
     if (!selected) return { mode: "direct" };
@@ -844,7 +829,10 @@ class CentralManager extends EventEmitter {
 
     const st = this.state.nodes.get(node.id) || {}; const availRate = Number(st.availabilityRate) || 0; const failStreak = this.availabilityTracker.hardFailStreak(node.id);
     const proxies = this.state?.config?.proxies || []; const isTooSlow = result.latency > CONSTANTS.LATENCY_CLAMP_MS; const belowAvail = availRate < CONSTANTS.AVAILABILITY_MIN_RATE;
-    if (proxies.length && (failStreak >= CONSTANTS.AVAILABILITY_EMERGENCY_FAILS || belowAvail || isTooSlow)) { if (failStreak >= CONSTANTS.AVAILABILITY_EMERGENCY_FAILS) this.nodeManager.switchCooldown.delete(node.id); await this.nodeManager.switchToBestNode(proxies); }
+    if (proxies.length && (failStreak >= CONSTANTS.AVAILABILITY_EMERGENCY_FAILS || belowAvail || isTooSlow)) {
+      if (failStreak >= CONSTANTS.AVAILABILITY_EMERGENCY_FAILS) this.nodeManager.switchCooldown.delete(node.id);
+      await this.nodeManager.switchToBestNode(proxies);
+    }
   }
 
   async handleProxyRequest(req, ...args) {
@@ -898,7 +886,7 @@ class CentralManager extends EventEmitter {
 
     if (context.targetGeo?.country && Array.isArray(Config.regionOptions?.regions)) {
       try {
-        const targetRegion = Config.regionOptions.regions.find(r => r && ((r.name && r.name.includes(context.targetGeo.country)) || (r.regex && r.regex.test(context.targetGeo.country))));
+        const targetRegion = Config.regionOptions.regions.find(r => r && ((r.name?.includes(context.targetGeo.country)) || (r.regex?.test(context.targetGeo.country))));
         if (targetRegion) {
           const regionNodes = Utils.filterProxiesByRegion(nodes, targetRegion);
           if (regionNodes?.length) {
@@ -967,9 +955,12 @@ class CentralManager extends EventEmitter {
     const doh = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query"];
     try {
       const queries = doh.map(u => this._safeFetch(`${u}?name=${encodeURIComponent(domain)}&type=A`, { headers: { "Accept": "application/dns-json", "User-Agent": "Mozilla/5.0" } }, CONSTANTS.GEO_INFO_TIMEOUT).catch(() => null));
-      let resp = null; for (const p of queries) { const r = await p; if (r) { resp = r; break; } } if (!resp) return null;
+      let resp = null;
+      for (const p of queries) { const r = await p; if (r && r.ok) { resp = r; break; } }
+      if (!resp) return null;
       const data = await resp.json().catch(() => ({}));
-      const ans = data.Answer?.find?.(a => /^\d+\.\d+\.\d+\.\d+$/.test(a.data));
+      const answers = Array.isArray(data.Answer) ? data.Answer : [];
+      const ans = answers.find(a => /^\d+\.\d+\.\d+\.\d+$/.test(a?.data));
       if (ans?.data) { this.lruCache.set(cacheKey, ans.data, 600000); return ans.data; }
       return null;
     } catch (error) { if (error.name !== "AbortError") Logger.error(`域名解析失败: ${error.message}`); return null; }
@@ -980,7 +971,7 @@ class CentralManager extends EventEmitter {
     if (!node.id || !(node.server || node.proxyUrl)) throw new InvalidRequestError(`代理请求失败: 节点缺少必要属性 (id: ${node?.id}, server: ${node?.server}, proxyUrl: ${node?.proxyUrl})`);
     try {
       const start = Utils.now(); const fetchOptions = (args && args.length && typeof args[0] === "object") ? args[0] : {};
-      const response = await this._safeFetch(node.proxyUrl, fetchOptions, CONSTANTS.NODE_TEST_TIMEOUT);
+      const response = await this._safeFetch(node.proxyUrl || (node.server ? `http://${node.server}` : ""), fetchOptions, CONSTANTS.NODE_TEST_TIMEOUT);
       const latency = Utils.now() - start; let bytes = 0; try { bytes = parseInt(response.headers?.get?.("Content-Length") || "0", 10); } catch {}
       return { success: true, latency, bytes, status: response.status, headers: response.headers };
     } catch (error) {
@@ -1074,7 +1065,12 @@ class CentralManager extends EventEmitter {
 
   getDynamicRiskWeights(f) {
     const base = { latency: 0.25, loss: 0.25, jitter: 0.15, successRate: 0.15, trend: 0.1, quality: 0.1 };
-    if (f.successRate < 0.8 || f.latencyStd > 50) { base.successRate = Math.min(0.3, base.successRate + 0.1); base.jitter = Math.min(0.3, base.jitter + 0.05); base.latency = Math.max(0.1, base.latency - 0.1); base.loss = Math.max(0.1, base.loss - 0.05); }
+    if (f.successRate < 0.8 || f.latencyStd > 50) {
+      base.successRate = Math.min(0.3, base.successRate + 0.1);
+      base.jitter = Math.min(0.3, base.jitter + 0.05);
+      base.latency = Math.max(0.1, base.latency - 0.1);
+      base.loss = Math.max(0.1, base.loss - 0.05);
+    }
     const sum = Object.values(base).reduce((s, v) => s + v, 0) || 1;
     return Object.keys(base).reduce((acc, k) => (acc[k] = base[k] / sum, acc), {});
   }
@@ -1093,12 +1089,17 @@ class CentralManager extends EventEmitter {
     const providerCount = (typeof safe?.["proxy-providers"] === "object" && safe["proxy-providers"] !== null) ? Object.keys(safe["proxy-providers"]).length : 0;
     if (proxyCount === 0 && providerCount === 0) throw new ConfigurationError("未检测到任何代理节点或代理提供者");
 
-    try { if (Config?.system && typeof Config.system === "object") Object.assign(safe, Config.system); if (Config?.dns && typeof Config.dns === "object") safe.dns = Config.dns; } catch (e) { Logger.warn("应用系统配置失败:", e.message); }
+    try {
+      if (Config?.system && typeof Config.system === "object") Object.assign(safe, Config.system);
+      if (Config?.dns && typeof Config.dns === "object") safe.dns = Config.dns;
+    } catch (e) { Logger.warn("应用系统配置失败:", e.message); }
 
     if (!Config || !Config.enable) { Logger.info("配置处理已禁用，返回原始配置"); return safe; }
 
-    try { const discovered = this.regionAutoManager.discoverRegionsFromProxies(safe.proxies || []); Config.regionOptions.regions = this.regionAutoManager.mergeNewRegions(Config.regionOptions?.regions || [], discovered); }
-    catch (e) { Logger.warn("自动发现新区域失败（不影响原逻辑）:", e.message); }
+    try {
+      const discovered = this.regionAutoManager.discoverRegionsFromProxies(safe.proxies || []);
+      Config.regionOptions.regions = this.regionAutoManager.mergeNewRegions(Config.regionOptions?.regions || [], discovered);
+    } catch (e) { Logger.warn("自动发现新区域失败（不影响原逻辑）:", e.message); }
 
     const { regionProxyGroups, otherProxyNames } = this.regionAutoManager.buildRegionGroups(safe, Config.regionOptions.regions || []);
     let regionGroupNames = [];
@@ -1108,11 +1109,18 @@ class CentralManager extends EventEmitter {
       regionGroupNames = Array.from(new Set(regionGroupNames));
     } catch (e) { Logger.warn("构建区域组名称列表失败:", e.message); }
 
-    try { safe["proxy-groups"] = [{ ...(Config.common?.proxyGroup || {}), name: "默认节点", type: "select", proxies: [...regionGroupNames, "直连"], icon: ICON_VAL(ICONS.Proxy) }]; }
-    catch (e) { Logger.warn("初始化代理组失败:", e.message); safe["proxy-groups"] = []; }
+    try {
+      safe["proxy-groups"] = [{
+        ...(Config.common?.proxyGroup || {}),
+        name: "默认节点", type: "select",
+        proxies: [...regionGroupNames, "直连"], icon: ICON_VAL(ICONS.Proxy)
+      }];
+    } catch (e) { Logger.warn("初始化代理组失败:", e.message); safe["proxy-groups"] = []; }
 
-    try { safe.proxies = Array.isArray(safe?.proxies) ? safe.proxies : []; if (!safe.proxies.some(p => p?.name === "直连")) safe.proxies.push({ name: "直连", type: "direct" }); }
-    catch (e) { Logger.warn("添加直连代理失败:", e.message); }
+    try {
+      safe.proxies = Array.isArray(safe?.proxies) ? safe.proxies : [];
+      if (!safe.proxies.some(p => p?.name === "直连")) safe.proxies.push({ name: "直连", type: "direct" });
+    } catch (e) { Logger.warn("添加直连代理失败:", e.message); }
 
     const ruleProviders = new Map(); const rules = [];
     try {
@@ -1126,7 +1134,12 @@ class CentralManager extends EventEmitter {
     try {
       if (Config.common?.defaultProxyGroups?.length) {
         Config.common.defaultProxyGroups.forEach(group => {
-          if (group?.name) safe["proxy-groups"].push({ ...(Config.common?.proxyGroup || {}), name: group.name, type: "select", proxies: [...(Array.isArray(group.proxies) ? group.proxies : []), ...regionGroupNames], url: group.url || (Config.common?.proxyGroup?.url || ""), icon: group.icon || "" });
+          if (group?.name) safe["proxy-groups"].push({
+            ...(Config.common?.proxyGroup || {}),
+            name: group.name, type: "select",
+            proxies: [...(Array.isArray(group.proxies) ? group.proxies : []), ...regionGroupNames],
+            url: group.url || (Config.common?.proxyGroup?.url || ""), icon: group.icon || ""
+          });
         });
       }
     } catch (e) { Logger.warn("添加默认代理组失败:", e.message); }
@@ -1221,13 +1234,18 @@ CentralManager.prototype.loadAIDBFromFile = function () {
           const data = JSON.parse(raw);
           if (typeof data === "object" && data !== null && !Array.isArray(data)) {
             let loaded = 0; Object.entries(data).forEach(([id, stats]) => {
-              if (id && typeof id === "string" && stats && typeof stats === "object") { try { this.state.metrics.set(id, Array.isArray(stats) ? stats : [stats]); loaded++; } catch (e) { Logger.debug(`加载节点数据失败 (${id}):`, e.message); } }
+              if (id && typeof id === "string" && stats && typeof stats === "object") {
+                try { this.state.metrics.set(id, Array.isArray(stats) ? stats : [stats]); loaded++; } catch (e) { Logger.debug(`加载节点数据失败 (${id}):`, e.message); }
+              }
             });
             Logger.info(`成功加载AI节点数据，共${loaded}条记录`);
           } else { Logger.warn("AI数据格式无效，预期为对象"); }
         } catch (e) {
           Logger.error("AI数据解析失败:", e?.stack || e);
-          try { if (typeof $persistentStore !== "undefined" && $persistentStore.write) $persistentStore.write("", "ai_node_data"); else if (PLATFORM.isBrowser && window.localStorage?.removeItem) window.localStorage.removeItem("ai_node_data"); } catch (delErr) { Logger.warn("删除损坏数据失败:", delErr.message); }
+          try {
+            if (typeof $persistentStore !== "undefined" && $persistentStore.write) $persistentStore.write("", "ai_node_data");
+            else if (PLATFORM.isBrowser && window.localStorage?.removeItem) window.localStorage.removeItem("ai_node_data");
+          } catch (delErr) { Logger.warn("删除损坏数据失败:", delErr.message); }
         }
       }
     } catch (e) { Logger.error("AI数据加载失败:", e?.stack || e); } finally { resolve(); }
@@ -1286,13 +1304,11 @@ CentralManager.prototype.testNodeMultiMetrics = async function (node) {
   }
 };
 
-/* ===================== 主流程入口 ===================== */
+/* ===================== 主流程入口与导出 ===================== */
 function main(config) {
   const centralManager = CentralManager.getInstance();
-  // 可按需启用自检
-  // centralManager.selfTest();
+  // centralManager.selfTest(); // 如需快速自检可打开
   return centralManager.processConfiguration(config);
 }
 
-/* ===================== 导出 ===================== */
 if (typeof module !== "undefined") { module.exports = { main, CentralManager, NodeManager, Config }; }
