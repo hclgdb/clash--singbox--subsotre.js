@@ -129,30 +129,63 @@ const Utils = {
   },
   filterProxiesByRegion(proxies, region) {
     if (!Array.isArray(proxies) || !region?.regex) return [];
+    const limit = Config?.regionOptions?.ratioLimit ?? 2;
     return proxies.filter(p => {
-      if (!p || typeof p.name !== "string") return false;
-      const m = p.name.match(/(?:[xX✕✖⨉]|倍率)(\d+\.?\d*)/i);
+      const name = p?.name; if (typeof name !== "string") return false;
+      const m = name.match(/(?:[xX✕✖⨉]|倍率)(\d+\.?\d*)/i);
       const mult = m ? parseFloat(m[1]) : 1;
-      return region.regex.test(p.name) && mult <= Config.regionOptions.ratioLimit;
+      return region.regex.test(name) && mult <= limit;
     }).map(p => p.name);
   },
+  // 优化后的媒体分组：质量优先/区域辅助/去重合并/自动兜底
   createServiceGroups(config, regionGroupNames, ruleProviders, rules) {
     if (!config || !Array.isArray(regionGroupNames) || !(ruleProviders instanceof Map) || !Array.isArray(rules)) return;
+    const central = CentralManager.getInstance?.();
+    const state = central?.state; const nm = central?.nodeManager;
+    const qualityOf = (name) => {
+      try {
+        const node = (config.proxies || []).find(p => p.name === name);
+        const id = node?.id; if (!id) return -Infinity;
+        const q = nm?.nodeQuality?.get(id) ?? 0;
+        const st = state?.nodes?.get(id) || {}; const avail = Number(st.availabilityRate) || 0;
+        const m = st.metrics || {}; const metricScore = CentralManager.scoreComponents(m).metricScore;
+        return q + metricScore * 0.5 + (avail >= CONSTANTS.AVAILABILITY_MIN_RATE ? 10 : -30);
+      } catch { return -Infinity; }
+    };
+    const unique = (arr) => Array.from(new Set(arr.filter(Boolean)));
+    const sortByQuality = (names) => unique(names).sort((a, b) => qualityOf(b) - qualityOf(a));
+    const ensureRuleProvider = (rp) => {
+      if (!rp || !rp.name) return;
+      ruleProviders.set(rp.name, {
+        ...Config.common.ruleProvider,
+        behavior: rp.behavior || "classical",
+        format: rp.format || "text",
+        url: rp.url,
+        path: `./ruleset/${rp.name.split('-')[0]}/${rp.name}.${rp.format || 'list'}`
+      });
+    };
+    const defaultUrl = Config?.common?.proxyGroup?.url || "";
+
     Config.services.forEach(service => {
       if (!Config.ruleOptions[service.id]) return;
       if (Array.isArray(service.rule)) rules.push(...service.rule);
-      if (service.ruleProvider) {
-        const rp = service.ruleProvider;
-        ruleProviders.set(rp.name, {
-          ...Config.common.ruleProvider,
-          behavior: rp.behavior || "classical",
-          format: rp.format || "text",
-          url: rp.url,
-          path: `./ruleset/${rp.name.split('-')[0]}/${rp.name}.${rp.format || 'list'}`
-        });
-      }
-      const proxies = service.proxies || ["默认节点", ...(service.proxiesOrder || []), ...regionGroupNames, "直连"];
-      config["proxy-groups"].push({ ...Config.common.proxyGroup, name: service.name, type: "select", proxies, url: service.url || Config.common.proxyGroup.url, icon: service.icon });
+      if (service.ruleProvider) ensureRuleProvider(service.ruleProvider);
+
+      // 构建候选代理：服务显式 -> 区域分组 -> 默认/直连兜底，按质量排序，去重
+      const explicit = Array.isArray(service.proxies) ? service.proxies : [];
+      const order = Array.isArray(service.proxiesOrder) ? service.proxiesOrder : [];
+      const region = Array.isArray(regionGroupNames) ? regionGroupNames : [];
+      const base = ["默认节点", ...order, ...region, "直连"];
+      const proxies = sortByQuality(explicit.length ? [...explicit, ...base] : base);
+
+      config["proxy-groups"].push({
+        ...Config.common.proxyGroup,
+        name: service.name,
+        type: "select",
+        proxies,
+        url: service.url || defaultUrl,
+        icon: service.icon
+      });
     });
   }
 };
