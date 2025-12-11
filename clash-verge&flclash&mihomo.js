@@ -70,6 +70,7 @@ const Utils = {
   clamp01: (v) => Math.max(0, Math.min(1, v)),
   isFunc: (f) => typeof f === "function",
   sleep(ms = 0) { return new Promise(r => setTimeout(r, Math.max(0, ms | 0))); },
+
   async retry(fn, attempts = CONSTANTS.MAX_RETRY_ATTEMPTS, delay = CONSTANTS.RETRY_DELAY_BASE) {
     const maxA = Math.max(1, Math.min(10, Math.floor(attempts)));
     const baseD = Math.max(0, Math.min(CONSTANTS.MAX_RETRY_BACKOFF_MS, Math.floor(delay)));
@@ -82,22 +83,24 @@ const Utils = {
     }
     throw lastErr || new Error("retry: 所有重试都失败");
   },
+
   async asyncPool(tasks, limit = CONSTANTS.CONCURRENCY_LIMIT) {
-    if (!Array.isArray(tasks) || !tasks.length) return [];
+    const list = Array.isArray(tasks) ? tasks.filter(Utils.isFunc) : [];
+    if (!list.length) return [];
     const n = Math.max(1, Math.min(50, Math.floor(limit) || 3));
-    const res = new Array(tasks.length);
+    const res = new Array(list.length);
     let idx = 0;
     async function runner() {
-      while (idx < tasks.length) {
-        const cur = idx++, t = tasks[cur];
-        if (!Utils.isFunc(t)) { res[cur] = { __error: new Error(`任务 ${cur} 不是函数`) }; continue; }
+      while (idx < list.length) {
+        const cur = idx++, t = list[cur];
         try { const v = t(); res[cur] = (v && typeof v.then === "function") ? await v : v; }
         catch (e) { res[cur] = { __error: e || new Error("任务执行失败") }; }
       }
     }
-    await Promise.all(Array(Math.min(n, tasks.length)).fill(0).map(runner));
+    await Promise.all(Array(Math.min(n, list.length)).fill(0).map(runner));
     return res;
   },
+
   calculateWeightedAverage(values, weightFactor = 0.9) {
     if (!Array.isArray(values) || !values.length) return 0;
     let sum = 0, wsum = 0, n = values.length;
@@ -120,6 +123,7 @@ const Utils = {
     const s = [...values].sort((a, b) => a - b), index = (p / 100) * (s.length - 1), i = Math.floor(index), f = index - i;
     return (i === index) ? s[index] : s[i] + (s[i + 1] - s[i]) * f;
   },
+
   isValidDomain(d) { return typeof d === "string" && /^[a-zA-Z0-9.-]+$/.test(d) && !d.startsWith(".") && !d.endsWith(".") && !d.includes(".."); },
   isIPv4(ip) { return typeof ip === "string" && /^(\d{1,3}\.){3}\d{1,3}$/.test(ip); },
   isPrivateIP(ip) {
@@ -127,6 +131,7 @@ const Utils = {
     try { const [a, b] = ip.split(".").map(n => parseInt(n, 10)); return a === 10 || a === 127 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31); }
     catch { return false; }
   },
+
   filterProxiesByRegion(proxies, region) {
     if (!Array.isArray(proxies) || !region?.regex) return [];
     const limit = Config?.regionOptions?.ratioLimit ?? 2;
@@ -137,11 +142,12 @@ const Utils = {
       return region.regex.test(name) && mult <= limit;
     }).map(p => p.name);
   },
-  // 优化后的媒体分组：质量优先/区域辅助/去重合并/自动兜底
+
   createServiceGroups(config, regionGroupNames, ruleProviders, rules) {
     if (!config || !Array.isArray(regionGroupNames) || !(ruleProviders instanceof Map) || !Array.isArray(rules)) return;
     const central = CentralManager.getInstance?.();
     const state = central?.state; const nm = central?.nodeManager;
+
     const qualityOf = (name) => {
       try {
         const node = (config.proxies || []).find(p => p.name === name);
@@ -152,10 +158,10 @@ const Utils = {
         return q + metricScore * 0.5 + (avail >= CONSTANTS.AVAILABILITY_MIN_RATE ? 10 : -30);
       } catch { return -Infinity; }
     };
-    const unique = (arr) => Array.from(new Set(arr.filter(Boolean)));
-    const sortByQuality = (names) => unique(names).sort((a, b) => qualityOf(b) - qualityOf(a));
+    const uniqueSorted = (arr) => Array.from(new Set(arr.filter(Boolean))).sort((a, b) => qualityOf(b) - qualityOf(a));
+
     const ensureRuleProvider = (rp) => {
-      if (!rp || !rp.name) return;
+      if (!rp?.name) return;
       ruleProviders.set(rp.name, {
         ...Config.common.ruleProvider,
         behavior: rp.behavior || "classical",
@@ -171,12 +177,8 @@ const Utils = {
       if (Array.isArray(service.rule)) rules.push(...service.rule);
       if (service.ruleProvider) ensureRuleProvider(service.ruleProvider);
 
-      // 构建候选代理：服务显式 -> 区域分组 -> 默认/直连兜底，按质量排序，去重
-      const explicit = Array.isArray(service.proxies) ? service.proxies : [];
-      const order = Array.isArray(service.proxiesOrder) ? service.proxiesOrder : [];
-      const region = Array.isArray(regionGroupNames) ? regionGroupNames : [];
-      const base = ["默认节点", ...order, ...region, "直连"];
-      const proxies = sortByQuality(explicit.length ? [...explicit, ...base] : base);
+      const base = ["默认节点", ...(Array.isArray(service.proxiesOrder) ? service.proxiesOrder : []), ...regionGroupNames, "直连"];
+      const proxies = uniqueSorted((Array.isArray(service.proxies) && service.proxies.length) ? [...service.proxies, ...base] : base);
 
       config["proxy-groups"].push({
         ...Config.common.proxyGroup,
@@ -226,6 +228,7 @@ class LRUCache {
     this.cache = new Map(); this.maxSize = Math.max(1, Number(maxSize) || CONSTANTS.LRU_CACHE_MAX_SIZE);
     this.ttl = Math.max(1, Number(ttl) || CONSTANTS.LRU_CACHE_TTL);
     this.head = { key: null }; this.tail = { key: null, prev: this.head }; this.head.next = this.tail;
+    this._lastCleanup = 0;
   }
   _unlink(n) { if (!n || n === this.head || n === this.tail) return; const { prev, next } = n; if (prev) prev.next = next; if (next) next.prev = prev; n.prev = n.next = null; }
   _pushFront(n) { if (!n) return; n.prev = this.head; n.next = this.head.next; if (this.head.next) this.head.next.prev = n; this.head.next = n; }
@@ -237,10 +240,13 @@ class LRUCache {
   }
   set(key, value, ttl = this.ttl) {
     if (key == null) return;
-    if (this.cache.size / this.maxSize > CONSTANTS.CACHE_CLEANUP_THRESHOLD) this._cleanupExpiredEntries(CONSTANTS.CACHE_CLEANUP_BATCH_SIZE);
-    if (this.cache.has(key)) { const e = this.cache.get(key); e.value = value; e.ttl = Math.max(1, ttl | 0); e.timestamp = Utils.now(); this._unlink(e); this._pushFront(e); return; }
+    const now = Utils.now();
+    if (this.cache.size / this.maxSize > CONSTANTS.CACHE_CLEANUP_THRESHOLD && now - this._lastCleanup > 500) {
+      this._cleanupExpiredEntries(CONSTANTS.CACHE_CLEANUP_BATCH_SIZE); this._lastCleanup = now;
+    }
+    if (this.cache.has(key)) { const e = this.cache.get(key); e.value = value; e.ttl = Math.max(1, ttl | 0); e.timestamp = now; this._unlink(e); this._pushFront(e); return; }
     if (this.cache.size >= this.maxSize) this._evictTail();
-    const e = { key, value, ttl: Math.max(1, ttl | 0), timestamp: Utils.now(), prev: null, next: null };
+    const e = { key, value, ttl: Math.max(1, ttl | 0), timestamp: now, prev: null, next: null };
     this._pushFront(e); this.cache.set(key, e);
   }
   _cleanupExpiredEntries(limit = 100) {
@@ -265,7 +271,7 @@ class SuccessRateTracker {
   reset() { this.successCount = 0; this.totalCount = 0; this.hardFailStreak = 0; }
 }
 
-/* ===================== GitHub 镜像选择 ===================== */
+/* ===================== GitHub 镜像选择（单例化锁/探测） ===================== */
 const GH_MIRRORS = ["", "https://mirror.ghproxy.com/", "https://github.moeyy.xyz/", "https://ghproxy.com/"];
 const GH_TEST_TARGETS = [
   "https://raw.githubusercontent.com/github/gitignore/main/Node.gitignore",
@@ -276,7 +282,8 @@ let GH_PROXY_PREFIX = "";
 let __ghSelected = "";
 let __ghLastProbeTs = 0;
 const __GH_PROBE_TTL = 10 * 60 * 1000;
-let __ghSelectLock = Promise.resolve();
+let __ghSelecting = false;
+let __ghSelectWaiters = [];
 
 const GH_RAW_URL = (path) => `${GH_PROXY_PREFIX}https://raw.githubusercontent.com/${path}`;
 const GH_RELEASE_URL = (path) => `${GH_PROXY_PREFIX}https://github.com/${path}`;
@@ -296,7 +303,11 @@ async function selectBestMirror(runtimeFetch) {
   const now = Utils.now();
   if (__ghSelected && (now - __ghLastProbeTs) < __GH_PROBE_TTL) return __ghSelected;
 
-  __ghSelectLock = __ghSelectLock.then(async () => {
+  if (__ghSelecting) {
+    return new Promise((resolve) => __ghSelectWaiters.push(resolve));
+  }
+  __ghSelecting = true;
+  try {
     const results = await Promise.all(GH_MIRRORS.map(m =>
       __probeMirror(m, runtimeFetch, CONSTANTS.GEO_INFO_TIMEOUT).then(ok => ({ m, ok })).catch(() => ({ m, ok: false }))
     ));
@@ -304,9 +315,16 @@ async function selectBestMirror(runtimeFetch) {
     const chosen = healthy.includes("") ? "" : (healthy[0] || __ghSelected || "");
     __ghSelected = chosen; __ghLastProbeTs = now; GH_PROXY_PREFIX = chosen;
     return chosen;
-  }).catch(e => { Logger.warn("selectBestMirror 失败，保持现有前缀:", e?.message || e); return __ghSelected || ""; });
-
-  return __ghSelectLock;
+  } catch (e) {
+    Logger.warn("selectBestMirror 失败，保持现有前缀:", e?.message || e);
+    return __ghSelected || "";
+  } finally {
+    __ghSelecting = false;
+    while (__ghSelectWaiters.length) {
+      const fn = __ghSelectWaiters.shift();
+      try { fn(__ghSelected || ""); } catch {}
+    }
+  }
 }
 
 /* ===================== 资源与图标 ===================== */
@@ -497,20 +515,20 @@ class NodeManager extends EventEmitter {
     Logger.info(`节点已切换: ${oldId || "无"} -> ${id} (区域: ${region})`);
     return node;
   }
+  _scoreNode(node, central) {
+    if (!node?.id) return 0;
+    const quality = this.nodeQuality.get(node.id) || 0;
+    const st = central?.state?.nodes?.get(node.id) || {};
+    const m = st.metrics || {};
+    const avail = Number(st.availabilityRate) || 0;
+    const { metricScore } = CentralManager.scoreComponents(m);
+    const successRate = Utils.clamp((this.nodeSuccess.get(node.id)?.rate || 0) * 100, 0, 100);
+    const qw = CONSTANTS.QUALITY_WEIGHT, mw = CONSTANTS.METRIC_WEIGHT, sw = CONSTANTS.SUCCESS_WEIGHT, tw = qw + mw + sw || 1;
+    return Utils.clamp((quality * (qw / tw)) + (metricScore * (mw / tw)) + (successRate * (sw / tw)) + (avail < CONSTANTS.AVAILABILITY_MIN_RATE ? CONSTANTS.BIAS_AVAIL_PENALTY_BAD : 0), 0, 100);
+  }
   _best(nodes) {
     const central = CentralManager.getInstance?.();
-    const scoreFor = (node) => {
-      if (!node?.id) return 0;
-      const quality = this.nodeQuality.get(node.id) || 0;
-      const st = central?.state?.nodes?.get(node.id) || {};
-      const m = st.metrics || {};
-      const avail = Number(st.availabilityRate) || 0;
-      const { metricScore } = CentralManager.scoreComponents(m);
-      const successRate = Utils.clamp((this.nodeSuccess.get(node.id)?.rate || 0) * 100, 0, 100);
-      const qw = CONSTANTS.QUALITY_WEIGHT, mw = CONSTANTS.METRIC_WEIGHT, sw = CONSTANTS.SUCCESS_WEIGHT, tw = qw + mw + sw || 1;
-      return Utils.clamp((quality * (qw / tw)) + (metricScore * (mw / tw)) + (successRate * (sw / tw)) + (avail < CONSTANTS.AVAILABILITY_MIN_RATE ? CONSTANTS.BIAS_AVAIL_PENALTY_BAD : 0), 0, 100);
-    };
-    return nodes.reduce((best, n) => (scoreFor(n) > scoreFor(best) ? n : best), nodes[0]);
+    return nodes.reduce((best, n) => (this._scoreNode(n, central) > this._scoreNode(best, central) ? n : best), nodes[0]);
   }
   async getBestNode(nodes, targetGeo) {
     if (!Array.isArray(nodes) || !nodes.length) { Logger.warn("getBestNode: 节点列表为空或无效"); return null; }
@@ -588,6 +606,8 @@ class RegionAutoManager {
 }
 
 /* ===================== 中央管理器 ===================== */
+const __runtimeCache = { fetch: null, AbortController: null };
+
 class CentralManager extends EventEmitter {
   static getInstance() { if (!CentralManager.instance) CentralManager.instance = new CentralManager(); return CentralManager.instance; }
   constructor() {
@@ -615,12 +635,16 @@ class CentralManager extends EventEmitter {
   }
 
   async _getFetchRuntime() {
+    if (__runtimeCache.fetch && __runtimeCache.AbortController !== undefined) {
+      return { _fetch: __runtimeCache.fetch, _AbortController: __runtimeCache.AbortController };
+    }
     let _fetch = (typeof fetch === "function") ? fetch : null;
     let _AbortController = (typeof AbortController !== "undefined") ? AbortController : null;
     if (!_fetch && PLATFORM.isNode) {
       try { const nf = require("node-fetch"); _fetch = nf.default || nf; } catch {}
       if (!_AbortController) { try { const AC = require("abort-controller"); _AbortController = AC.default || AC; } catch { if (typeof AbortController !== "undefined") _AbortController = AbortController; } }
     }
+    __runtimeCache.fetch = _fetch; __runtimeCache.AbortController = _AbortController;
     return { _fetch, _AbortController };
   }
   isGeoExternalLookupEnabled() { return !(Config?.privacy && Config.privacy.geoExternalLookup === false); }
@@ -787,6 +811,15 @@ class CentralManager extends EventEmitter {
     });
   }
 
+  _biasScore(c, prefers) {
+    const { preferHighThroughput, preferLowLatency, preferStability } = prefers;
+    return c.score
+      + ((c.availability >= CONSTANTS.AVAILABILITY_MIN_RATE) ? CONSTANTS.BIAS_AVAIL_BONUS_OK : CONSTANTS.BIAS_AVAIL_PENALTY_BAD)
+      + (preferHighThroughput ? Math.min(10, Math.round(Math.log10(1 + c.bps) * 2)) : 0)
+      + (preferLowLatency ? Utils.clamp(CONSTANTS.BIAS_LATENCY_MAX_BONUS - (c.latency / 30), 0, CONSTANTS.BIAS_LATENCY_MAX_BONUS) : 0)
+      - (preferStability ? Math.min(CONSTANTS.BIAS_JITTER_MAX_PENALTY, Math.round(c.jitter / 50)) : 0);
+  }
+
   async onRequestOutbound(reqCtx = {}) {
     if (!this.state?.config) throw new ConfigurationError("系统配置未初始化");
     const nodes = this.state.config.proxies || []; if (!nodes.length) return { mode: "direct" };
@@ -826,24 +859,18 @@ class CentralManager extends EventEmitter {
       return { node: n, score: st.score || 0, availability: st.availabilityRate || 0, latency: Number(m.latency) || Infinity, bps: Number(m.bps) || 0, jitter: Number(m.jitter) || 0 };
     }).filter(c => c.node?.id);
 
-    const bias = (c) => c.score
-      + ((c.availability >= CONSTANTS.AVAILABILITY_MIN_RATE) ? CONSTANTS.BIAS_AVAIL_BONUS_OK : CONSTANTS.BIAS_AVAIL_PENALTY_BAD)
-      + (preferHighThroughput ? Math.min(10, Math.round(Math.log10(1 + c.bps) * 2)) : 0)
-      + (preferLowLatency ? Utils.clamp(CONSTANTS.BIAS_LATENCY_MAX_BONUS - (c.latency / 30), 0, CONSTANTS.BIAS_LATENCY_MAX_BONUS) : 0)
-      - (preferStability ? Math.min(CONSTANTS.BIAS_JITTER_MAX_PENALTY, Math.round(c.jitter / 50)) : 0);
-
     let candidates = enriched;
     const regionPreferred = (targetGeo?.country && Array.isArray(Config.regionOptions?.regions))
       ? Utils.filterProxiesByRegion(nodes, Config.regionOptions.regions.find(r => r && ((r.name?.includes(targetGeo.country)) || (r.regex?.test(targetGeo.country)))))
       : null;
-
     if (regionPreferred?.length) {
       const set = new Set(regionPreferred);
       const regionCandidates = candidates.filter(c => set.has(c.node.name));
       if (regionCandidates.length) candidates = regionCandidates;
     }
 
-    const ordered = (candidates.length ? candidates : enriched).sort((a, b) => bias(b) - bias(a)).map(c => c.node);
+    const prefers = { preferHighThroughput, preferLowLatency, preferStability };
+    const ordered = (candidates.length ? candidates : enriched).sort((a, b) => this._biasScore(b, prefers) - this._biasScore(a, prefers)).map(c => c.node);
     const bestNode = await this.nodeManager.getBestNode(ordered.length ? ordered : nodes, targetGeo);
     const selected = bestNode || nodes[0];
 
@@ -1259,13 +1286,14 @@ CentralManager.prototype.loadAIDBFromFile = function () {
       let raw = ""; let storage = null;
       try { if (typeof $persistentStore !== "undefined" && $persistentStore) storage = $persistentStore; else if (PLATFORM.isBrowser && window.localStorage) storage = window.localStorage; } catch (e) { Logger.debug("存储检测失败:", e.message); }
       if (storage) {
-        try { raw = typeof storage.getItem === "function" ? (storage.getItem("ai_node_data") || "") : (typeof storage.read === "function" ? (storage.read("ai_node_data") || "") : ""); }
-        catch (e) { Logger.warn("读取存储数据失败:", e.message); raw = ""; }
+        try {
+          raw = typeof storage.getItem === "function" ? (storage.getItem("ai_node_data") || "") : (typeof storage.read === "function" ? (storage.read("ai_node_data") || "") : "");
+        } catch (e) { Logger.warn("读取存储数据失败:", e.message); raw = ""; }
       }
       if (raw && typeof raw === "string" && raw.trim()) {
         try {
           const data = JSON.parse(raw);
-          if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+          if (data && typeof data === "object" && !Array.isArray(data)) {
             let loaded = 0; Object.entries(data).forEach(([id, stats]) => {
               if (id && typeof id === "string" && stats && typeof stats === "object") {
                 try { this.state.metrics.set(id, Array.isArray(stats) ? stats : [stats]); loaded++; } catch (e) { Logger.debug(`加载节点数据失败 (${id}):`, e.message); }
@@ -1276,9 +1304,10 @@ CentralManager.prototype.loadAIDBFromFile = function () {
         } catch (e) {
           Logger.error("AI数据解析失败:", e?.stack || e);
           try {
-            if (typeof $persistentStore !== "undefined" && $persistentStore.write) $persistentStore.write("", "ai_node_data");
-            else if (PLATFORM.isBrowser && window.localStorage?.removeItem) window.localStorage.removeItem("ai_node_data");
-          } catch (delErr) { Logger.warn("删除损坏数据失败:", delErr.message); }
+            const empty = "{}";
+            if (typeof $persistentStore !== "undefined" && $persistentStore.write) $persistentStore.write(empty, "ai_node_data");
+            else if (PLATFORM.isBrowser && window.localStorage?.setItem) window.localStorage.setItem("ai_node_data", empty);
+          } catch (delErr) { Logger.warn("重置损坏数据失败:", delErr.message); }
         }
       }
     } catch (e) { Logger.error("AI数据加载失败:", e?.stack || e); } finally { resolve(); }
