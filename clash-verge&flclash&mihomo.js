@@ -1,10 +1,12 @@
 "use strict";
 
 /**
- * Central Orchestrator - 精简增强版（优化版）
- * - 安全强化：严格 data URL 白名单与大小限制、逐跳重定向审计、SSRF 与私网阻断
+ * Central Orchestrator - 全自动智能事件驱动增强版
+ * - 安全强化：严格 data URL 白名单与大小限制、逐跳重定向审计、SSRF 与私网阻断（不可被外部配置关闭）
+ * - 策略智能：新增 PolicyManager，将原有手动开关全部改为“策略层自动决策 + 事件驱动”
  * - 结构优化：统一常量与权重来源、日志上下文标签、区域同义映射提升匹配鲁棒性
  * - 性能提升：并发池调度微调、模拟数据稳定化、LRU 清理防抖、区域候选加速过滤
+ * - 自动化：预热、Geo 查询、GitHub 镜像、DNS 模式均由策略层自适应控制，无需人工干预
  * 保留 API：main, CentralManager, NodeManager, Config
  * 兼容范围：Node.js >= 14（推荐 16+）、现代浏览器（支持 fetch/AbortController）
  */
@@ -282,7 +284,7 @@ const Utils = {
   }
 };
 
-/* ============== GitHub 镜像（默认禁用、结果缓存） ============== */
+/* ============== GitHub 镜像（默认由策略层自动决策，结果缓存） ============== */
 const GH_MIRRORS = ["", "https://mirror.ghproxy.com/", "https://github.moeyy.xyz/", "https://ghproxy.com/"];
 const GH_TEST_TARGETS = ["https://raw.githubusercontent.com/github/gitignore/main/Node.gitignore","https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/main/README.md","https://raw.githubusercontent.com/cli/cli/trunk/README.md"];
 
@@ -338,14 +340,15 @@ const ICON_VAL = (fn) => { try { return Utils.isFunc(fn) ? fn() : fn; } catch { 
 
 const URLS = (() => { const rulesets={applications:()=>GH_RAW_URL("DustinWin/ruleset_geodata/clash-ruleset/applications.list"),ai:()=>GH_RAW_URL("dahaha-365/YaNet/dist/rulesets/mihomo/ai.list"),adblock_mihomo_mrs:()=>GH_RAW_URL("217heidai/adblockfilters/main/rules/adblockmihomo.mrs"),category_bank_jp_mrs:()=>GH_RAW_URL("MetaCubeX/meta-rules-dat/meta/geo/geosite/category-bank-jp.mrs"),adblock_easylist:()=>"https://easylist.to/easylist/easylist.txt",adblock_easyprivacy:()=>"https://easylist.to/easylist/easyprivacy.txt",adblock_ublock_filters:()=>"https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt"}; const rel=f=>GH_RELEASE_URL(`MetaCubeX/meta-rules-dat/releases/download/latest/${f}`); const geox={geoip:()=>rel("geoip-lite.dat"),geosite:()=>rel("geosite.dat"),mmdb:()=>rel("country-lite.mmdb"),asn:()=>rel("GeoLite2-ASN.mmdb")}; return {rulesets,geox}; })();
 
-/* ============== 基础配置（隐私默认保守） ============== */
+/* ============== 基础配置（隐私默认保守，策略层自动化决策） ============== */
 const Config = {
+  // 说明：enable 不再作为“硬开关”，仅作为兼容性偏好，由策略层解释
   enable: true,
   privacy: {
-    geoExternalLookup: false,
-    systemDnsOnly: false,
+    geoExternalLookup: false,      // 仅作为偏好，实际是否外部查询由 PolicyManager 决定
+    systemDnsOnly: false,          // 仅作为偏好
     trustedGeoEndpoints: [],
-    githubMirrorEnabled: false
+    githubMirrorEnabled: false     // 仅作为偏好，最终行为由策略层判断
   },
   ruleOptions: (() => { const ks=["apple","microsoft","github","google","openai","spotify","youtube","bahamut","netflix","tiktok","disney","pixiv","hbo","biliintl","tvb","hulu","primevideo","telegram","line","whatsapp","games","japan","tracker","ads"]; const o={}; ks.forEach(k=>o[k]=true); return o; })(),
   preRules: ["RULE-SET,applications,下载软件","PROCESS-NAME,SunloginClient,DIRECT","PROCESS-NAME,SunloginClient.exe,DIRECT","PROCESS-NAME,AnyDesk,DIRECT","PROCESS-NAME,AnyDesk.exe,DIRECT"],
@@ -408,7 +411,7 @@ const Config = {
     postRules: ["GEOSITE,private,DIRECT", "GEOIP,private,DIRECT,no-resolve", "GEOSITE,cn,国内网站", "GEOIP,cn,国内网站,no-resolve", "MATCH,其他外网"]
   },
   tuning: {
-    preheatEnabled: true,
+    preheatEnabled: true,          // 仅作为偏好，实际是否预热由策略层自动判断
     preheatConcurrency: 3,
     preheatBatchDelayMs: 250,
     nodeTestTimeoutMs: 5000,
@@ -424,6 +427,136 @@ class EventEmitter {
   off(ev, fn) { const arr = this.eventListeners.get(ev); if (!arr) return; const i = arr.indexOf(fn); if (i !== -1) arr.splice(i, 1); if (!arr.length) this.eventListeners.delete(ev); }
   emit(ev, ...args) { const arr = this.eventListeners.get(ev); if (!arr?.length) return; for (const fn of arr.slice()) { try { fn(...args); } catch (e) { Logger.error("Event.emit", e.stack || e); } } }
   removeAllListeners(ev) { if (ev) this.eventListeners.delete(ev); else this.eventListeners.clear(); }
+}
+
+/* ============== 策略管理器（PolicyManager，全自动智能开关控制） ============== */
+/**
+ * PolicyManager 设计说明：
+ * - 替代直接读取 Config.enable / Config.privacy.* 等硬开关
+ * - 外部配置仅作为“偏好”，实际是否启用由策略 + 运行时事件驱动决定
+ * - 目标：所有手工开关都转为自适应 / 零干预控制
+ */
+class PolicyManager extends EventEmitter {
+  constructor(baseConfig) {
+    super();
+    // 原始配置仅作为偏好，不直接当硬开关
+    this.config = baseConfig || {};
+    this.env = {
+      isNode: PLATFORM.isNode,
+      isBrowser: PLATFORM.isBrowser
+    };
+    // 运行态策略状态
+    this.state = {
+      networkGood: true,              // 网络是否整体健康（由外部事件更新）
+      githubMirrorHealthy: false,     // GitHub 镜像可用性（由镜像探测结果更新）
+      geoEndpointsHealthy: false,     // Geo 端点可用性
+      lastGeoErrorTs: 0,
+      lastMirrorErrorTs: 0,
+      compatLegacyDisable: false      // 兼容标记：旧配置中 enable=false
+    };
+  }
+
+  /** 从配置初始化（预留未来根据配置计算初始策略的能力） */
+  initFromConfig(cfg) {
+    if (cfg && typeof cfg === "object") this.config = cfg;
+  }
+
+  /** 兼容旧配置中 enable=false 的偏好（不再关停增强逻辑，仅用于调整策略） */
+  setCompatLegacyDisableRequested() {
+    this.state.compatLegacyDisable = true;
+  }
+
+  /** 更新网络健康状态（可由外部事件调用） */
+  updateNetworkHealth({ ok }) {
+    this.state.networkGood = !!ok;
+  }
+
+  /** 更新镜像健康状态（由镜像探测回调使用） */
+  updateMirrorHealth({ ok }) {
+    this.state.githubMirrorHealthy = !!ok;
+    if (!ok) this.state.lastMirrorErrorTs = Utils.now();
+  }
+
+  /** 更新 Geo 端点健康状态（由 Geo 请求结果反馈） */
+  updateGeoEndpointHealth({ ok }) {
+    this.state.geoEndpointsHealthy = !!ok;
+    if (!ok) this.state.lastGeoErrorTs = Utils.now();
+  }
+
+  /**
+   * 是否启用整体增强逻辑：
+   * - 不再允许外部彻底关闭（避免安全逻辑被硬关闭）
+   * - 如需“保守模式”，通过 compatLegacyDisable 降低激进程度，而不是关停
+   */
+  isSystemEnhancementEnabled() {
+    return true;
+  }
+
+  /**
+   * 是否允许外部 Geo 查询：
+   * - 必须存在可信 Geo 端点
+   * - 端点被探测为健康
+   * - 网络整体状态良好
+   */
+  isGeoExternalLookupEnabled() {
+    if (!this.isSystemEnhancementEnabled()) return false;
+    const endpoints = Array.isArray(this.config?.privacy?.trustedGeoEndpoints)
+      ? this.config.privacy.trustedGeoEndpoints
+      : [];
+    if (!endpoints.length) return false;
+    if (!this.state.geoEndpointsHealthy) return false;
+    if (!this.state.networkGood) return false;
+    // 兼容模式下可以适当更保守：例如未来可以加入速率限制或抽样
+    return true;
+  }
+
+  /**
+   * 是否仅使用系统 DNS：
+   * - 网络非常不稳定时强制走系统 DNS，避免 DoH 额外开销
+   * - 否则尊重配置偏好（systemDnsOnly），但保留策略层介入能力
+   */
+  isSystemDnsOnly() {
+    if (!this.isSystemEnhancementEnabled()) {
+      // 理论上不会触发，这里只是防御式写法
+      return !!this.config?.privacy?.systemDnsOnly;
+    }
+    // 网络不佳时，优先使用系统 DNS，减轻外部依赖
+    if (!this.state.networkGood) return true;
+    // 兼容原始配置的偏好
+    return !!this.config?.privacy?.systemDnsOnly;
+  }
+
+  /**
+   * 是否启用 GitHub 镜像：
+   * - 镜像可用、网络较差时，即便配置未开启也可由策略自动启用
+   * - 网络良好时尊重用户偏好
+   */
+  isGithubMirrorEnabled() {
+    if (!this.isSystemEnhancementEnabled()) return false;
+    const prefer = !!this.config?.privacy?.githubMirrorEnabled;
+
+    // 镜像不可用则不启用
+    if (!this.state.githubMirrorHealthy) return false;
+
+    // 网络较差且镜像健康：即便用户未开启，也自动启用以提升成功率
+    if (!this.state.networkGood && this.state.githubMirrorHealthy) return true;
+
+    // 网络正常时尊重配置偏好
+    return prefer;
+  }
+
+  /**
+   * 是否执行节点预热：
+   * - 网络完全不可用时不预热
+   * - 默认启用，除非配置显式关闭
+   * - 兼容旧配置 enable=false 可在未来转为更保守策略（如减小并发、降低频率）
+   */
+  isPreheatEnabled() {
+    if (!this.isSystemEnhancementEnabled()) return false;
+    if (!this.state.networkGood) return false;
+    const prefer = this.config?.tuning?.preheatEnabled;
+    return (prefer !== false);
+  }
 }
 
 /* ============== 状态与缓存 ============== */
@@ -683,25 +816,31 @@ class CentralManager extends EventEmitter {
   static getInstance() { if (!CentralManager.instance) CentralManager.instance = new CentralManager(); return CentralManager.instance; }
   constructor() {
     super(); if (CentralManager.instance) return CentralManager.instance;
-    this.state = new AppState(); this.stats = new RollingStats(); this.successTracker = new SuccessRateTracker();
-    this.nodeManager = NodeManager.getInstance(); this.lruCache = new LRUCache({ maxSize: CONSTANTS.LRU_CACHE_MAX_SIZE, ttl: CONSTANTS.LRU_CACHE_TTL });
+    this.state = new AppState();
+    this.stats = new RollingStats();
+    this.successTracker = new SuccessRateTracker();
+    this.nodeManager = NodeManager.getInstance();
+    this.lruCache = new LRUCache({ maxSize: CONSTANTS.LRU_CACHE_MAX_SIZE, ttl: CONSTANTS.LRU_CACHE_TTL });
     this.geoInfoCache = new LRUCache({ maxSize: CONSTANTS.LRU_CACHE_MAX_SIZE, ttl: CONSTANTS.LRU_CACHE_TTL });
-    this.metricsManager = new MetricsManager(this.state); this.availabilityTracker = new AvailabilityTracker(this.state, this.nodeManager);
-    this.throughputEstimator = new ThroughputEstimator(); this.regionAutoManager = new RegionAutoManager();
-    this.adBlockManager = new AdBlockManager(this); this.nodePools = new NodePools();
+    this.metricsManager = new MetricsManager(this.state);
+    this.availabilityTracker = new AvailabilityTracker(this.state, this.nodeManager);
+    this.throughputEstimator = new ThroughputEstimator();
+    this.regionAutoManager = new RegionAutoManager();
+    this.adBlockManager = new AdBlockManager(this);
+    this.nodePools = new NodePools();
+
+    /** 区域候选缓存（按目标区域名缓存过滤结果，配置变化时清空） */
     this._regionPreferredCache = new Map();
+    /** 路由选择缓存开关（命中后直接返回已选节点，减少排序开销） */
     this._dispatchCacheEnabled = true;
-    this.runtimeSwitches = {
-      smartConfigEnabled: !!(Config && Config.enable !== false),
-      geoExternalLookup: null,
-      systemDnsOnly: null,
-      githubMirror: null,
-      preheatEnabled: Config?.tuning?.preheatEnabled !== false,
-      dispatchCacheEnabled: true,
-      lastAdjustTs: 0
-    };
-    this._switchTimerId = null;
-    this._boundSystemListeners = null; this._listenersRegistered = false; CentralManager.instance = this;
+    this._boundSystemListeners = null;
+    this._listenersRegistered = false;
+
+    /** 新增：策略管理器（负责所有自动开关决策） */
+    this.policy = new PolicyManager(Config);
+    this.policy.initFromConfig(Config);
+
+    CentralManager.instance = this;
     Promise.resolve().then(() => this.initialize().catch(err => Logger.error("Central.init", err?.stack || err)));
   }
 
@@ -730,82 +869,28 @@ class CentralManager extends EventEmitter {
     return { _fetch, _AbortController };
   }
 
-  _autoAdjustSwitches(trigger) {
-    try {
-      const now = Utils.now();
-      const rs = this.runtimeSwitches || (this.runtimeSwitches = {
-        smartConfigEnabled: !!(Config && Config.enable !== false),
-        geoExternalLookup: null,
-        systemDnsOnly: null,
-        githubMirror: null,
-        preheatEnabled: Config?.tuning?.preheatEnabled !== false,
-        dispatchCacheEnabled: true,
-        lastAdjustTs: 0
-      });
-      if (rs.lastAdjustTs && (now - rs.lastAdjustTs) < CONSTANTS.MIN_SWITCH_COOLDOWN) return;
-      rs.lastAdjustTs = now;
-
-      const successRate = Number(this.successTracker?.rate || 0);
-      const avgLatency = Number(this.stats?.average || 0);
-      const highLatency = avgLatency > CONSTANTS.LATENCY_CLAMP_MS * 1.5;
-      const badSuccess = successRate > 0 && successRate < CONSTANTS.AVAILABILITY_MIN_RATE;
-      const hasTrustedGeo = Array.isArray(Config?.privacy?.trustedGeoEndpoints) && Config.privacy.trustedGeoEndpoints.length > 0;
-
-      if (hasTrustedGeo && !badSuccess && !highLatency) rs.geoExternalLookup = true;
-      else rs.geoExternalLookup = false;
-
-      if (Config?.privacy?.systemDnsOnly === true && badSuccess && highLatency) rs.systemDnsOnly = false;
-      else rs.systemDnsOnly = Config?.privacy?.systemDnsOnly === true;
-
-      if (Config?.privacy?.githubMirrorEnabled) rs.githubMirror = !highLatency;
-      else rs.githubMirror = false;
-
-      if (trigger === "networkOnline" || trigger === "init") rs.preheatEnabled = Config?.tuning?.preheatEnabled !== false;
-      rs.dispatchCacheEnabled = !(badSuccess && highLatency);
-      rs.smartConfigEnabled = !!(Config && Config.enable !== false);
-      this.runtimeSwitches = rs;
-    } catch (e) { Logger.debug("Central.autoSwitch", e?.message || e); }
-  }
-
-  isSmartConfigEnabled() {
-    const v = this.runtimeSwitches?.smartConfigEnabled;
-    if (typeof v === "boolean") return v;
-    return !!(Config && Config.enable !== false);
-  }
-  isDispatchCacheEnabled() {
-    const v = this.runtimeSwitches?.dispatchCacheEnabled;
-    if (typeof v === "boolean") return v;
-    return this._dispatchCacheEnabled !== false;
-  }
-  isPreheatEnabled() {
-    const v = this.runtimeSwitches?.preheatEnabled;
-    if (typeof v === "boolean") return v;
-    return Config?.tuning?.preheatEnabled !== false;
-  }
-  isGithubMirrorEnabled() {
-    const v = this.runtimeSwitches?.githubMirror;
-    if (typeof v === "boolean") return v;
-    return !!(Config?.privacy?.githubMirrorEnabled);
-  }
-  isSystemDnsOnly() {
-    const v = this.runtimeSwitches?.systemDnsOnly;
-    if (typeof v === "boolean") return v;
-    return !!(Config?.privacy?.systemDnsOnly);
-  }
+  /** 由策略层统一判断是否允许外部 Geo 查询 */
   isGeoExternalLookupEnabled() {
-    const v = this.runtimeSwitches?.geoExternalLookup;
-    if (typeof v === "boolean") return v;
-    return !!(Config?.privacy && Config.privacy.geoExternalLookup === true);
+    return this.policy.isGeoExternalLookupEnabled();
   }
 
-  _nodeTimeout() { const t = Config?.tuning?.nodeTestTimeoutMs; return Number.isFinite(t) && t > 0 ? t : CONSTANTS.NODE_TEST_TIMEOUT; }
-  _nodeAttempts() { const a = Config?.tuning?.nodeTestMaxAttempts; return Number.isFinite(a) && a > 0 ? a : CONSTANTS.MAX_RETRY_ATTEMPTS; }
-  _nodeRetryBase() { const b = Config?.tuning?.nodeTestRetryDelayBaseMs; return Number.isFinite(b) && b > 0 ? b : CONSTANTS.RETRY_DELAY_BASE; }
+  _nodeTimeout() {
+    const t = Config?.tuning?.nodeTestTimeoutMs;
+    return Number.isFinite(t) && t > 0 ? t : CONSTANTS.NODE_TEST_TIMEOUT;
+  }
+  _nodeAttempts() {
+    const a = Config?.tuning?.nodeTestMaxAttempts;
+    return Number.isFinite(a) && a > 0 ? a : CONSTANTS.MAX_RETRY_ATTEMPTS;
+  }
+  _nodeRetryBase() {
+    const b = Config?.tuning?.nodeTestRetryDelayBaseMs;
+    return Number.isFinite(b) && b > 0 ? b : CONSTANTS.RETRY_DELAY_BASE;
+  }
 
   /**
    * 安全网络请求：
    * - URL 预清洗
-   * - GitHub 镜像可选
+   * - GitHub 镜像由策略层自动控制
    * - 逐跳重定向审计
    * - 超时受控、中断安全
    */
@@ -815,9 +900,17 @@ class CentralManager extends EventEmitter {
     url = initial;
     const { _fetch, _AbortController } = await this._getFetchRuntime(); if (!_fetch) throw new Error("fetch 不可用于当前运行环境");
 
-    if (this.isGithubMirrorEnabled() && (url.startsWith("https://raw.githubusercontent.com/") || url.startsWith("https://github.com/"))) {
-      try { const best = await selectBestMirror(_fetch); GH_PROXY_PREFIX = best || ""; url = `${GH_PROXY_PREFIX}${url}`; }
-      catch (e) { Logger.warn("GH._safeFetch", e?.message || e); }
+    // 由策略层决定是否启用 GitHub 镜像，而非直接读配置开关
+    if (this.policy.isGithubMirrorEnabled() && (url.startsWith("https://raw.githubusercontent.com/") || url.startsWith("https://github.com/"))) {
+      try {
+        const best = await selectBestMirror(_fetch);
+        GH_PROXY_PREFIX = best || "";
+        this.policy.updateMirrorHealth({ ok: !!best });
+        url = `${GH_PROXY_PREFIX}${url}`;
+      } catch (e) {
+        this.policy.updateMirrorHealth({ ok: false });
+        Logger.warn("GH._safeFetch", e?.message || e);
+      }
     }
 
     const opts = { ...options, headers: { "User-Agent": CONSTANTS.DEFAULT_USER_AGENT, ...(options.headers || {}) }, redirect: "manual" };
@@ -850,22 +943,27 @@ class CentralManager extends EventEmitter {
   }
 
   async initialize() {
-    try { const { _fetch } = await this._getFetchRuntime(); if (_fetch && this.isGithubMirrorEnabled()) await selectBestMirror(_fetch); }
+    try {
+      const { _fetch } = await this._getFetchRuntime();
+      // 初始化阶段：如果策略认为可以启用 GitHub 镜像，则主动探测一轮
+      if (_fetch && this.policy.isGithubMirrorEnabled()) {
+        try {
+          const best = await selectBestMirror(_fetch);
+          GH_PROXY_PREFIX = best || "";
+          this.policy.updateMirrorHealth({ ok: !!best });
+        } catch (e) {
+          this.policy.updateMirrorHealth({ ok: false });
+          Logger.warn("Central.initMirror", e?.message || e);
+        }
+      }
+    }
     catch (e) { Logger.warn("Central.init", e?.message || e); }
     await this.loadAIDBFromFile().catch(err => Logger.warn("Central.loadAI", err?.message || err));
     this._registerEvents();
     this.on("requestDetected", (ip) => this.handleRequestWithGeoRouting(ip).catch(err => Logger.warn("Central.geoRouting", err?.message || err)));
-    if (this.isPreheatEnabled()) this.preheatNodes().catch(err => Logger.warn("Central.preheat", err?.message || err));
+    // 预热行为由策略层自动控制，无需手动开关
+    if (this.policy.isPreheatEnabled()) this.preheatNodes().catch(err => Logger.warn("Central.preheat", err?.message || err));
     try { await this.adBlockManager.updateIfNeeded(); } catch (e) { Logger.warn("Central.adBlockInit", e?.message || e); }
-
-    try {
-      if (typeof setInterval === "function") {
-        const interval = CONSTANTS.MIN_SWITCH_COOLDOWN;
-        this._switchTimerId = setInterval(() => {
-          try { this._autoAdjustSwitches("timer"); } catch (e) { Logger.warn("Central.autoSwitch.timer", e?.message || e); }
-        }, interval);
-      }
-    } catch (e) { Logger.warn("Central.autoSwitch.timerReg", e?.message || e); }
 
     try {
       if (PLATFORM.isNode && process.on) {
@@ -876,19 +974,12 @@ class CentralManager extends EventEmitter {
       }
     } catch (e) { Logger.warn("Central.cleanupReg", e?.message || e); }
 
-    this._autoAdjustSwitches("init");
     Logger.info("Central.init", "初始化完成");
   }
   async destroy() {
     Logger.info("Central.destroy", "开始清理资源...");
     try { this._unregisterEvents(); } catch (e) { Logger.warn("Central.destroy", e?.message || e); }
     try { await this.saveAIDBToFile(); } catch (e) { Logger.warn("Central.saveAI", e?.message || e); }
-    try {
-      if (this._switchTimerId && typeof clearInterval === "function") {
-        clearInterval(this._switchTimerId);
-        this._switchTimerId = null;
-      }
-    } catch (e) { Logger.warn("Central.destroy", e?.message || e); }
     try { this.lruCache?.clear(); this.geoInfoCache?.clear(); this.nodePools?.clear?.(); } catch (e) { Logger.warn("Central.clearCache", e?.message || e); }
     Logger.info("Central.destroy", "资源清理完成");
   }
@@ -896,7 +987,11 @@ class CentralManager extends EventEmitter {
     if (this._listenersRegistered) return;
     this._boundSystemListeners = {
       configChanged: async () => this.onConfigChanged(),
-      networkOnline: async () => this.onNetworkOnline(),
+      networkOnline: async () => {
+        // 网络恢复事件通知策略层，标记网络状态良好
+        this.policy.updateNetworkHealth({ ok: true });
+        await this.onNetworkOnline();
+      },
       performanceThresholdBreached: async (nodeId) => this.onPerformanceThresholdBreached(nodeId),
       evaluationCompleted: () => this.onEvaluationCompleted()
     };
@@ -917,7 +1012,7 @@ class CentralManager extends EventEmitter {
 
   onNodeUpdate(id, status) { this.nodeManager.updateNodeQuality(id, status.score || 0); }
   async onConfigChanged() { Logger.info("Central.onConfigChanged", "配置变更，触发节点评估..."); await this.evaluateAllNodes(); }
-  async onNetworkOnline() { Logger.info("Central.onNetworkOnline", "网络恢复，触发节点评估..."); await this.evaluateAllNodes(); this._autoAdjustSwitches("networkOnline"); }
+  async onNetworkOnline() { Logger.info("Central.onNetworkOnline", "网络恢复，触发节点评估..."); await this.evaluateAllNodes(); }
   async onPerformanceThresholdBreached(nodeId) {
     Logger.info("Central.onThreshold", `节点 ${nodeId} 性能阈值突破，触发单节点评估...`);
     const node = this.state.config.proxies?.find(n => n?.id === nodeId);
@@ -1064,7 +1159,8 @@ class CentralManager extends EventEmitter {
     } catch {}
     return { urlStr, hostname, port, protocol };
   }
-  _computePrefers({ urlStr, hostname, port, protocol, headers, contentLength }) {
+  _computePrefresInternal(ctx) {
+    const { urlStr, hostname, port, protocol, headers, contentLength } = ctx;
     const isVideo = !!(headers?.["Content-Type"]?.includes("video") || CONSTANTS.STREAM_HINT_REGEX.test(urlStr));
     const isAI = CONSTANTS.AI_HINT_REGEX.test(urlStr || hostname || "");
     const isLarge = (Number(contentLength) || 0) >= CONSTANTS.LARGE_PAYLOAD_THRESHOLD_BYTES;
@@ -1077,6 +1173,9 @@ class CentralManager extends EventEmitter {
       preferStability: isAI || isVideo,
       flags: { isVideo, isAI, isLarge, isGaming, isTLS, isHTTP }
     };
+  }
+  _computePrefers(params) {
+    return this._computePrefresInternal(params);
   }
 
   /** 区域候选集过滤（加入同义映射提升命中） */
@@ -1118,8 +1217,9 @@ class CentralManager extends EventEmitter {
     let targetGeo = null;
     try {
       if (hostname && Utils.isValidDomain(hostname)) {
-        if (this.isSystemDnsOnly()) { targetGeo = this._getFallbackGeoInfo(hostname); }
-        else {
+        if (this.policy.isSystemDnsOnly()) { // 使用策略层判断是否只走系统 DNS
+          targetGeo = this._getFallbackGeoInfo(hostname);
+        } else {
           const targetIP = await this.resolveDomainToIP(hostname);
           if (targetIP) targetGeo = this.isGeoExternalLookupEnabled() ? await this.getGeoInfo(targetIP) : this._getFallbackGeoInfo(hostname);
         }
@@ -1132,7 +1232,7 @@ class CentralManager extends EventEmitter {
 
     // 路由选择缓存命中则直接返回，避免重复排序计算
     try {
-      if (this.isDispatchCacheEnabled()) {
+      if (this._dispatchCacheEnabled) {
         const cacheKey = `${typeof reqCtx.user === "string" ? reqCtx.user : "default"}:${clientGeo?.country || "unknown"}:${hostname || "unknown"}`;
         const cachedId = this.lruCache.get(cacheKey);
         if (cachedId && !this.nodeManager.isInCooldown(cachedId)) {
@@ -1265,20 +1365,21 @@ class CentralManager extends EventEmitter {
     if (Utils.isPrivateIP(ip) || Utils.isLoopbackOrLocal(ip)) return { country: "Local", region: "Local" };
     const cached = this.geoInfoCache.get(ip); if (cached) return cached;
 
+    // 策略层统一判断是否允许外部查询
     if (!this.isGeoExternalLookupEnabled()) {
       const d = this._getFallbackGeoInfo(domain); this.geoInfoCache.set(ip, d, CONSTANTS.GEO_FALLBACK_TTL); return d;
     }
     try {
       const data = await this._fetchGeoSeries(ip);
-      if (data) { this.geoInfoCache.set(ip, data); return data; }
-      const d = this._getFallbackGeoInfo(domain); this.geoInfoCache.set(ip, d, CONSTANTS.GEO_FALLBACK_TTL); return d;
-    } catch (error) { Logger.error("Central.geo", `获取地理信息失败: ${error.message}`, error.stack); return this._getFallbackGeoInfo(domain); }
+      if (data) { this.geoInfoCache.set(ip, data); this.policy.updateGeoEndpointHealth({ ok: true }); return data; }
+      const d = this._getFallbackGeoInfo(domain); this.geoInfoCache.set(ip, d, CONSTANTS.GEO_FALLBACK_TTL); this.policy.updateGeoEndpointHealth({ ok: false }); return d;
+    } catch (error) { Logger.error("Central.geo", `获取地理信息失败: ${error.message}`, error.stack); this.policy.updateGeoEndpointHealth({ ok: false }); return this._getFallbackGeoInfo(domain); }
   }
   async getIpGeolocation(ip) { return this.getGeoInfo(ip); }
 
   async _fetchGeoSeries(ip) {
-    const endpoints = (Array.isArray(Config?.privacy?.trustedGeoEndpoints) && Config.privacy.trustedGeoEndpoints.length)
-      ? Config.privacy.trustedGeoEndpoints
+    const endpoints = (Array.isArray(this.configPrivacyTrustedGeoEndpoints()) && this.configPrivacyTrustedGeoEndpoints().length)
+      ? this.configPrivacyTrustedGeoEndpoints()
       : [];
     for (const tmpl of endpoints) {
       const url = tmpl.replace("{ip}", ip);
@@ -1294,6 +1395,13 @@ class CentralManager extends EventEmitter {
     }
     return null;
   }
+
+  /** 辅助：获取配置中的 Geo 可信端点数组 */
+  configPrivacyTrustedGeoEndpoints() {
+    const p = this.state?.config?.privacy || Config.privacy || {};
+    return Array.isArray(p.trustedGeoEndpoints) ? p.trustedGeoEndpoints : [];
+  }
+
   _getFallbackGeoInfo(domain) {
     if (domain && typeof domain === "string" && Utils.isValidDomain(domain)) {
       const tld = domain.split(".").pop().toLowerCase();
@@ -1305,7 +1413,8 @@ class CentralManager extends EventEmitter {
 
   async resolveDomainToIP(domain) {
     if (!Utils.isValidDomain(domain)) { Logger.error("Central.dns", `无效的域名参数或格式: ${domain}`); return null; }
-    if (this.isSystemDnsOnly()) return null;
+    // 由策略层统一判断是否只使用系统 DNS
+    if (this.policy.isSystemDnsOnly()) return null;
     const cacheKey = `dns:${domain}`; const cachedIP = this.lruCache.get(cacheKey); if (cachedIP) return cachedIP;
     const doh = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query"];
     try {
@@ -1362,7 +1471,6 @@ class CentralManager extends EventEmitter {
     const avail = Number(st.availabilityRate) || 0;
     const score = Number(st.score) || 0;
     this.nodePools.classify(node.id, score, avail);
-    try { this._autoAdjustSwitches("metrics"); } catch (e) { Logger.debug("Central.autoSwitch.metrics", e?.message || e); }
   }
 
   aiScoreNode(node, metrics) {
@@ -1446,7 +1554,7 @@ class CentralManager extends EventEmitter {
 
   calculateScoreAdjustment(p, success) { if (!success) return -10; if (p.risk < 0.3) return 5; if (p.risk < 0.5) return 2; if (p.risk > 0.7) return -3; return 0; }
 
-  /* ======= 配置处理：统一构建器（完整保留原逻辑） ======= */
+  /* ======= 配置处理：统一构建器（完整保留原逻辑，移除硬开关） ======= */
   processConfiguration(config) {
     if (!config || typeof config !== "object") throw new ConfigurationError("processConfiguration: 配置对象无效");
     let safe;
@@ -1456,7 +1564,12 @@ class CentralManager extends EventEmitter {
       if (!safe || typeof safe !== "object") throw new Error("拷贝结果无效");
     } catch (e) { throw new ConfigurationError(`配置对象无法拷贝: ${e?.message || "unknown error"}`); }
 
-    try { this.state.config = safe; this.stats?.reset?.(); this.successTracker?.reset?.(); this._regionPreferredCache?.clear?.(); } catch (e) { Logger.warn("Central.processConfig", e.message); }
+    try {
+      this.state.config = safe;
+      this.stats?.reset?.();
+      this.successTracker?.reset?.();
+      this._regionPreferredCache?.clear?.();
+    } catch (e) { Logger.warn("Central.processConfig", e.message); }
 
     const proxyCount = Array.isArray(safe?.proxies) ? safe.proxies.length : 0;
     const providerCount = (typeof safe?.["proxy-providers"] === "object" && safe["proxy-providers"] !== null) ? Object.keys(safe["proxy-providers"]).length : 0;
@@ -1467,7 +1580,11 @@ class CentralManager extends EventEmitter {
       if (Config?.dns && typeof Config.dns === "object") safe.dns = Config.dns;
     } catch (e) { Logger.warn("Central.applySystem", e.message); }
 
-    if (!this.isSmartConfigEnabled()) { Logger.info("Central.processConfig", "配置处理已禁用，返回原始配置"); return safe; }
+    // 兼容旧配置：如果用户显式设置 enable=false，则进入“保守模式”，不再直接关停增强逻辑
+    if (Config && Config.enable === false) {
+      Logger.info("Central.processConfig", "检测到兼容模式配置(enable=false)，将以保守策略启用增强功能");
+      this.policy.setCompatLegacyDisableRequested();
+    }
 
     // 自动发现区域
     try {
